@@ -1,0 +1,11 @@
+[package]
+name = "empiresgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Phase 4: Add texture rendering - Latest APIs
+winit = "0.30"
+wgpu = "26.0"
+pollster = "0.4"  # For blocking on async GPU operations
+bytemuck = { version = "1.23", features = ["derive"] }  # For vertex buffer casting
