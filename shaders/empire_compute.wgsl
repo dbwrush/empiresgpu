@@ -144,6 +144,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Check if this is water (below ocean cutoff)
     let is_water = altitude < ocean_cutoff;
     
+    // Calculate terrain factor for strength generation (empiresbevy style)
+    // Lower elevation (closer to ocean) = higher generation rate
+    let terrain_strength = 0.7; // TERRAIN_STRENGTH constant from empiresbevy
+    let normalized_land_height = (altitude - ocean_cutoff) / (1.0 - ocean_cutoff); // 0-1 for land
+    let terrain_factor = pow(1.0 - normalized_land_height, 1.0 + 4.0 * terrain_strength) * terrain_strength + (1.0 - terrain_strength);
+    
     var new_empire_id = empire_id;
     var new_strength = strength;
     var new_need = need;
@@ -155,43 +161,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         new_strength = 0u;
         new_need = 0u;
         new_action = 0u;
-    }
-    // If this cell belongs to an empire (empire_id != 0) and is on land, it will try to spread
-    else if (empire_id != 0u) {
-        // Try to find a valid target (not same empire)
-        var chosen_direction = 6u; // Invalid direction initially
-        var attempts = 0u;
-        
-        // Try up to 6 times to find a valid target
-        while (attempts < 6u && chosen_direction >= 6u) {
-            let test_direction = rng_range(global_id.x, global_id.y, frame_data, attempts, 6u);
-            let target_offset = get_hex_neighbor_offset(test_direction, pos.y);
-            let target_pos = pos + target_offset;
-            let target_cell = get_cell(target_pos);
-            let target_empire = float_to_u8(target_cell.r);
-            
-            // Check if target is water
-            let target_terrain = get_terrain(target_pos);
-            let target_is_water = target_terrain.r < 0.53;
-            
-            // Only attack if target is different empire, on land, and not water
-            if (target_empire != empire_id && !target_is_water) {
-                chosen_direction = test_direction;
-            }
-            attempts++;
-        }
-        
-        // If we found a valid target, set the action
-        if (chosen_direction < 6u) {
-            // Set action: first 3 bits = direction, remaining 5 bits = all 1s (31 = 0b11111)
-            new_action = chosen_direction | (31u << 3u); // direction + strength allocation bits
-        } else {
-            // No valid targets, don't attack
-            new_action = 0u;
-        }
     } else {
-        // Check if any neighboring empire cells are trying to claim this unclaimed cell
-        var claiming_empire = 0u;
+        // Handle unclaimed land cells - set initial strength based on terrain
+        if (empire_id == 0u && strength == 0u) {
+            // Convert terrain altitude to initial strength (0-255 range)
+            // DEBUG: Much lower initial strength to allow expansion testing
+            new_strength = u32(altitude * 50.0); // DEBUG: Much weaker initial strength
+        }
+        
+        // PHASE 1: Resolve incoming attacks and update strength/ownership
+        // Calculate total incoming attack strength from all directions
+        var total_attack_strength = 0.0;
+        var attacking_empire = 0u;
+        var found_attacker = false;
         
         // Check all 6 hex directions for incoming attacks
         for (var dir = 0u; dir < 6u; dir++) {
@@ -199,57 +181,94 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let neighbor_pos = pos + neighbor_offset;
             let neighbor_cell = get_cell(neighbor_pos);
             let neighbor_empire = float_to_u8(neighbor_cell.r);
+            let neighbor_strength = float_to_u8(neighbor_cell.g);
             let neighbor_action = float_to_u8(neighbor_cell.a);
             
-            // If neighbor has an empire and is acting (action != 0)
+            // If neighbor has an empire and is attacking (action != 0)
             if (neighbor_empire != 0u && neighbor_action != 0u) {
-                let neighbor_direction = neighbor_action & 7u; // Extract first 3 bits (now 0-5)
+                let neighbor_direction = neighbor_action & 7u; // Extract direction (0-5)
                 
-                // Calculate where the neighbor is attacking using hex grid
+                // Calculate where the neighbor is attacking
                 let neighbor_target_offset = get_hex_neighbor_offset(neighbor_direction, neighbor_pos.y);
                 let neighbor_target = neighbor_pos + neighbor_target_offset;
                 
-                // If the neighbor is attacking this cell, claim it
+                // If the neighbor is attacking this cell
                 if (neighbor_target.x == pos.x && neighbor_target.y == pos.y) {
-                    claiming_empire = neighbor_empire;
-                    break;
+                    // Only count attacks from different empires
+                    if (neighbor_empire != empire_id) {
+                        let attack_strength = f32(neighbor_strength) / 255.0; // Convert to 0-1 range
+                        total_attack_strength += attack_strength;
+                        
+                        // Remember one of the attacking empires (last one wins if multiple)
+                        if (!found_attacker) {
+                            attacking_empire = neighbor_empire;
+                            found_attacker = true;
+                        }
+                    }
                 }
             }
         }
         
-        // If an empire is claiming this cell, convert it
-        if (claiming_empire != 0u) {
-            new_empire_id = claiming_empire;
-            new_strength = 128u; // Default strength for new cells
-            new_need = 64u;     // Default need for new cells
+        // Apply combat resolution (3:1 defender advantage)
+        if (total_attack_strength > 0.0) {
+            let current_strength_f = f32(new_strength) / 255.0; // Convert to 0-1 range
+            let damage = total_attack_strength / 3.0; // 3:1 defender advantage
             
-            // Newly claimed cells should also try to attack in the same frame
-            // Try to find a valid target (not same empire)
+            if (damage >= current_strength_f) {
+                // Cell is conquered - change ownership
+                new_empire_id = attacking_empire;
+                new_strength = u32((damage - current_strength_f) * 255.0); // Remaining attack strength becomes new strength
+                new_need = 64u; // Reset need for newly conquered cell
+            } else {
+                // Cell survives but takes damage
+                new_strength = u32((current_strength_f - damage) * 255.0);
+            }
+        }
+        
+        // PHASE 2: Generate strength for occupied cells and plan attacks
+        if (new_empire_id != 0u) {
+            // Generate strength based on terrain factor (only for occupied cells)
+            let strength_generation = terrain_factor * 255.0 / 10.0; // DEBUG: Much faster generation for testing
+            new_strength = min(255u, new_strength + u32(strength_generation));
+            
+            // Plan attack if we have enough strength
+            let current_strength_f = f32(new_strength) / 255.0;
+            
+            // Look for weakest enemy neighbor to attack
+            var min_enemy_strength = 2.0; // Higher than max possible (1.0)
             var chosen_direction = 6u; // Invalid direction initially
-            var attempts = 0u;
             
-            // Try up to 6 times to find a valid target
-            while (attempts < 6u && chosen_direction >= 6u) {
-                let test_direction = rng_range(global_id.x, global_id.y, frame_data, attempts + 10u, 6u);
-                let target_offset = get_hex_neighbor_offset(test_direction, pos.y);
+            for (var dir = 0u; dir < 6u; dir++) {
+                let target_offset = get_hex_neighbor_offset(dir, pos.y);
                 let target_pos = pos + target_offset;
                 let target_cell = get_cell(target_pos);
                 let target_empire = float_to_u8(target_cell.r);
+                let target_strength = f32(float_to_u8(target_cell.g)) / 255.0;
                 
-                // Only attack if target is different empire (including unclaimed = 0)
-                if (target_empire != claiming_empire) {
-                    chosen_direction = test_direction;
+                // Check if target is water
+                let target_terrain = get_terrain(target_pos);
+                let target_is_water = target_terrain.r < ocean_cutoff;
+                
+                // Only consider targets that are different empire, on land, and weaker
+                if (target_empire != new_empire_id && !target_is_water) {
+                    if (target_strength < min_enemy_strength) {
+                        // Check if we have enough strength to make meaningful attack
+                        let required_strength = target_strength * 3.0; // Need to overcome 3:1 advantage
+                        
+                        // DEBUG: Much lower threshold for testing
+                        if (current_strength_f > required_strength * 0.1) { // Much more aggressive for debugging
+                            min_enemy_strength = target_strength;
+                            chosen_direction = dir;
+                        }
+                    }
                 }
-                attempts++;
             }
             
-            // If we found a valid target, set the action
+            // Set attack action if we found a valid target
             if (chosen_direction < 6u) {
-                // Set action: first 3 bits = direction, remaining 5 bits = all 1s (31 = 0b11111)
                 new_action = chosen_direction | (31u << 3u); // direction + strength allocation bits
             } else {
-                // No valid targets, don't attack
-                new_action = 0u;
+                new_action = 0u; // No valid targets
             }
         }
     }
