@@ -25,7 +25,7 @@ use ui::FpsTracker;
 // The system will automatically handle camera centering, workgroup dispatch, and vertex buffer sizing
 // Note: GPU texture size limits typically cap this at 8192x8192. Larger values will be constrained.
 // For truly large simulations (>8192), see SCALING.md for storage buffer implementation approaches.
-const SIMULATION_SIZE: u32 = 16384;
+const SIMULATION_SIZE: u32 = 1024;
 
 struct State {
     graphics: GraphicsContext,
@@ -116,7 +116,7 @@ impl State {
                 timestamp_writes: None,
             });
 
-            // Render simulation
+            // Render simulation (terrain + empires)
             self.simulation.render(&mut render_pass, &self.vertex_buffer, &self.camera.bind_group);
             
             // Render FPS overlay

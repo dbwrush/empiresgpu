@@ -12,3 +12,4 @@ bytemuck = { version = "1.23", features = ["derive"] }  # For vertex buffer cast
 wgpu_text = "26.0.0"
 ab_glyph = "0.2.31"
 glyph_brush = "0.7.12"
+noise = "0.9"  # For terrain generation with simplex noise

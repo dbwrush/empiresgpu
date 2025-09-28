@@ -1,15 +1,63 @@
 use wgpu::util::DeviceExt;
 use crate::graphics::{GraphicsContext, load_shader};
+use noise::{NoiseFn, Simplex};
+
+// Generate terrain data using simplex noise
+fn generate_terrain_data(size: u32) -> Vec<u8> {
+    println!("Generating terrain data with simplex noise...");
+    
+    let altitude_noise = Simplex::new(12345);
+    let humidity_noise = Simplex::new(67890);
+    let temperature_noise = Simplex::new(54321);
+    
+    let mut terrain_data = Vec::with_capacity((size * size * 4) as usize);
+    
+    let scale = 0.01; // Noise scale - smaller values = larger features
+    
+    for y in 0..size {
+        for x in 0..size {
+            let fx = x as f64 * scale;
+            let fy = y as f64 * scale;
+            
+            // Generate altitude (0-255, higher = mountains, lower = sea level)
+            let altitude = ((altitude_noise.get([fx, fy]) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0) as u8;
+            
+            // Generate humidity (0-255, higher = more humid)
+            // Add some correlation with altitude (mountains tend to be less humid)
+            let base_humidity = ((humidity_noise.get([fx * 1.5, fy * 1.5]) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
+            let altitude_factor = 1.0 - (altitude as f64 / 255.0) * 0.3; // Reduce humidity at high altitudes
+            let humidity = (base_humidity * altitude_factor).clamp(0.0, 255.0) as u8;
+            
+            // Generate temperature (0-255, higher = warmer)
+            // Add some correlation with altitude (mountains tend to be colder)
+            let base_temperature = ((temperature_noise.get([fx * 0.8, fy * 0.8]) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
+            let temp_altitude_factor = 1.0 - (altitude as f64 / 255.0) * 0.4; // Reduce temperature at high altitudes
+            let temperature = (base_temperature * temp_altitude_factor).clamp(0.0, 255.0) as u8;
+            
+            // Store as RGBA: R=altitude, G=humidity, B=temperature, A=unused
+            terrain_data.push(altitude);
+            terrain_data.push(humidity);
+            terrain_data.push(temperature);
+            terrain_data.push(255u8); // Alpha channel (unused)
+        }
+    }
+    
+    println!("Terrain generation complete!");
+    terrain_data
+}
 
 pub struct EmpireSimulation {
     pub texture_a: wgpu::Texture,
     pub texture_b: wgpu::Texture,
+    pub terrain_texture: wgpu::Texture,  // Read-only terrain data (altitude, humidity, temperature)
     pub compute_bind_group_a: wgpu::BindGroup,
     pub compute_bind_group_b: wgpu::BindGroup,
     pub display_bind_group_a: wgpu::BindGroup,
     pub display_bind_group_b: wgpu::BindGroup,
+    pub terrain_bind_group: wgpu::BindGroup,     // For terrain rendering
     pub compute_pipeline: wgpu::ComputePipeline,
     pub render_pipeline: wgpu::RenderPipeline,
+    pub terrain_pipeline: wgpu::RenderPipeline,  // For terrain rendering
     pub current_is_a: bool,
     pub frame_count: u32,
     pub simulation_speed: u32,
@@ -76,9 +124,34 @@ impl EmpireSimulation {
         
         let texture_b = graphics.device.create_texture(&texture_desc);
         
+        // Generate and create terrain texture (read-only)
+        let terrain_data = generate_terrain_data(game_size);
+        let terrain_texture_desc = wgpu::TextureDescriptor {
+            label: Some("Terrain Texture"),
+            size: wgpu::Extent3d {
+                width: game_size,
+                height: game_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm, // Use RGBA format, ignore alpha channel
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        
+        let terrain_texture = graphics.device.create_texture_with_data(
+            &graphics.queue,
+            &terrain_texture_desc,
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &terrain_data,
+        );
+        
         // Create texture views
         let game_view_a = texture_a.create_view(&wgpu::TextureViewDescriptor::default());
         let game_view_b = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+        let terrain_view = terrain_texture.create_view(&wgpu::TextureViewDescriptor::default());
         
         let texture_sampler = graphics.device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -132,6 +205,16 @@ impl EmpireSimulation {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    },
+                    count: None,
+                },
             ],
         });
         
@@ -169,6 +252,10 @@ impl EmpireSimulation {
                     binding: 2,
                     resource: frame_uniform_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&terrain_view),
+                },
             ],
         });
         
@@ -187,6 +274,10 @@ impl EmpireSimulation {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: frame_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&terrain_view),
                 },
             ],
         });
@@ -267,6 +358,68 @@ impl EmpireSimulation {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: graphics.config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+        
+        // Create terrain bind group for rendering
+        let terrain_bind_group = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Terrain Bind Group"),
+            layout: &display_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&terrain_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+            ],
+        });
+        
+        // Load terrain render shader
+        let terrain_shader = load_shader(&graphics.device, "shaders/terrain_render.wgsl");
+        
+        // Create terrain render pipeline
+        let terrain_pipeline = graphics.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Terrain Render Pipeline"),
+            layout: Some(&graphics.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Terrain Pipeline Layout"),
+                bind_group_layouts: &[&display_bind_group_layout, camera_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: &terrain_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[crate::graphics::Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &terrain_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: graphics.config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -291,17 +444,20 @@ impl EmpireSimulation {
             cache: None,
         });
         
-        println!("Empire simulation pipeline created! Ready to simulate.");
+        println!("Empire simulation and terrain pipelines created! Ready to simulate.");
         
         Self {
             texture_a,
             texture_b,
+            terrain_texture,
             compute_bind_group_a,
             compute_bind_group_b,
             display_bind_group_a,
             display_bind_group_b,
+            terrain_bind_group,
             compute_pipeline,
             render_pipeline,
+            terrain_pipeline,
             current_is_a: true,
             frame_count: 0,
             simulation_speed: 1, // Update every frame for immediate feedback
@@ -419,6 +575,14 @@ impl EmpireSimulation {
 
     
     pub fn render(&self, render_pass: &mut wgpu::RenderPass, vertex_buffer: &wgpu::Buffer, camera_bind_group: &wgpu::BindGroup) {
+        // First, render the terrain (opaque background)
+        render_pass.set_pipeline(&self.terrain_pipeline);
+        render_pass.set_bind_group(0, &self.terrain_bind_group, &[]);
+        render_pass.set_bind_group(1, camera_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        render_pass.draw(0..6, 0..1);
+        
+        // Then, render the empire simulation (translucent on top)
         render_pass.set_pipeline(&self.render_pipeline);
         
         // Use the current texture for display

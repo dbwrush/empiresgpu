@@ -7,6 +7,9 @@ var output_texture: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(2)
 var<uniform> frame_data: u32;
 
+@group(0) @binding(3)
+var terrain_texture: texture_2d<f32>;
+
 // High-quality pseudorandom number generator using PCG algorithm
 // Returns a pseudorandom u32 based on position and frame
 fn pcg_hash(x: u32, y: u32, frame: u32) -> u32 {
@@ -42,6 +45,18 @@ fn get_cell(pos: vec2<i32>) -> vec4<f32> {
         (pos.y + i32(dims.y)) % i32(dims.y)
     );
     return textureLoad(input_texture, wrapped_pos, 0);
+}
+
+// Get terrain data at position with wrapping
+// Returns vec3<f32> with (altitude, humidity, temperature) normalized to [0,1]
+fn get_terrain(pos: vec2<i32>) -> vec3<f32> {
+    let dims = textureDimensions(terrain_texture);
+    let wrapped_pos = vec2<i32>(
+        (pos.x + i32(dims.x)) % i32(dims.x),
+        (pos.y + i32(dims.y)) % i32(dims.y)
+    );
+    let terrain_data = textureLoad(terrain_texture, wrapped_pos, 0);
+    return terrain_data.rgb; // altitude, humidity, temperature
 }
 
 // Convert float [0,1] to u8 [0,255]
@@ -118,6 +133,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let strength = float_to_u8(current_cell.g);
     let need = float_to_u8(current_cell.b);
     let action = float_to_u8(current_cell.a);
+    
+    // Read terrain data (for testing - will be used for AI decisions later)
+    let terrain = get_terrain(pos);
+    let altitude = terrain.r;   // 0.0 to 1.0
+    let humidity = terrain.g;   // 0.0 to 1.0  
+    let temperature = terrain.b; // 0.0 to 1.0
     
     var new_empire_id = empire_id;
     var new_strength = strength;

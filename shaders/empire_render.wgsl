@@ -49,21 +49,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let cell_data = textureSample(t_texture, s_texture, adjusted_tex_coords);
     let empire_id = cell_data.r;
     
-    // Visualize different empires with different colors
+    // Visualize different empires with different colors and transparency
     if (empire_id == 0.0) {
-        // Unclaimed territory - light brown/tan to distinguish from out-of-bounds
-        return vec4<f32>(0.4, 0.3, 0.2, 1.0);
-    } else if (empire_id < 0.004) { // Empire 1 (1/255 ≈ 0.004)
-        // Empire 1 - bright red
-        return vec4<f32>(1.0, 0.2, 0.2, 1.0);
-    } else if (empire_id < 0.008) { // Empire 2 (2/255 ≈ 0.008)
-        // Empire 2 - bright blue
-        return vec4<f32>(0.2, 0.2, 1.0, 1.0);
-    } else if (empire_id < 0.012) { // Empire 3 (3/255 ≈ 0.012)
-        // Empire 3 - bright green
-        return vec4<f32>(0.2, 1.0, 0.2, 1.0);
+        // Unclaimed territory - completely transparent to show terrain underneath
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
-        // Other empires - yellow for now
-        return vec4<f32>(1.0, 1.0, 0.2, 1.0);
+        // Claimed territory - translucent colors to show terrain underneath
+        let alpha = 0.7; // Semi-transparent
+        
+        if (empire_id < 0.004) { // Empire 1 (1/255 ≈ 0.004)
+            // Empire 1 - bright red
+            return vec4<f32>(1.0, 0.2, 0.2, alpha);
+        } else if (empire_id < 0.008) { // Empire 2 (2/255 ≈ 0.008)
+            // Empire 2 - bright blue
+            return vec4<f32>(0.2, 0.2, 1.0, alpha);
+        } else if (empire_id < 0.012) { // Empire 3 (3/255 ≈ 0.012)
+            // Empire 3 - bright green
+            return vec4<f32>(0.2, 1.0, 0.2, alpha);
+        } else {
+            // Other empires - yellow
+            return vec4<f32>(1.0, 1.0, 0.2, alpha);
+        }
     }
 }
