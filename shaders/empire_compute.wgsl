@@ -7,10 +7,31 @@ var output_texture: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(2)
 var<uniform> frame_data: u32;
 
-// TODO: Implement proper unbiased RNG - current implementation has directional bias
+// High-quality pseudorandom number generator using PCG algorithm
+// Returns a pseudorandom u32 based on position and frame
+fn pcg_hash(x: u32, y: u32, frame: u32) -> u32 {
+    // Combine inputs into a single seed
+    var state = x ^ (y << 16u) ^ (frame << 8u);
+    
+    // PCG algorithm - permuted congruential generator
+    state = state * 1664525u + 1013904223u;
+    state ^= state >> 16u;
+    state = state * 1664525u + 1013904223u;
+    state ^= state >> 16u;
+    state = state * 1664525u + 1013904223u;
+    
+    return state;
+}
+
+// Generic RNG function that returns a value in range [0, max_value)
+fn rng_range(x: u32, y: u32, frame: u32, seed_offset: u32, max_value: u32) -> u32 {
+    let hash = pcg_hash(x, y, frame + seed_offset);
+    return hash % max_value;
+}
+
+// Get random hex direction (0-5) for attacking
 fn get_hex_direction(x: u32, y: u32, frame: u32) -> u32 {
-    // Placeholder: just return 0 for now (will be replaced with proper RNG later)
-    return 0u;
+    return rng_range(x, y, frame, 0u, 6u);
 }
 
 // Get cell data at position with wrapping
@@ -105,11 +126,33 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     // If this cell belongs to an empire (empire_id != 0), it will try to spread
     if (empire_id != 0u) {
-        // TODO: Replace with proper unbiased RNG - current implementation is biased
-        let direction = get_hex_direction(global_id.x, global_id.y, frame_data);
+        // Try to find a valid target (not same empire)
+        var chosen_direction = 6u; // Invalid direction initially
+        var attempts = 0u;
         
-        // Set action: first 3 bits = direction, remaining 5 bits = all 1s (31 = 0b11111)
-        new_action = direction | (31u << 3u); // direction + strength allocation bits
+        // Try up to 6 times to find a valid target
+        while (attempts < 6u && chosen_direction >= 6u) {
+            let test_direction = rng_range(global_id.x, global_id.y, frame_data, attempts, 6u);
+            let target_offset = get_hex_neighbor_offset(test_direction, pos.y);
+            let target_pos = pos + target_offset;
+            let target_cell = get_cell(target_pos);
+            let target_empire = float_to_u8(target_cell.r);
+            
+            // Only attack if target is different empire (including unclaimed = 0)
+            if (target_empire != empire_id) {
+                chosen_direction = test_direction;
+            }
+            attempts++;
+        }
+        
+        // If we found a valid target, set the action
+        if (chosen_direction < 6u) {
+            // Set action: first 3 bits = direction, remaining 5 bits = all 1s (31 = 0b11111)
+            new_action = chosen_direction | (31u << 3u); // direction + strength allocation bits
+        } else {
+            // No valid targets, don't attack
+            new_action = 0u;
+        }
     } else {
         // Check if any neighboring empire cells are trying to claim this unclaimed cell
         var claiming_empire = 0u;
@@ -122,8 +165,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let neighbor_empire = float_to_u8(neighbor_cell.r);
             let neighbor_action = float_to_u8(neighbor_cell.a);
             
-            // If neighbor has an empire and is acting
-            if (neighbor_empire != 0u) {
+            // If neighbor has an empire and is acting (action != 0)
+            if (neighbor_empire != 0u && neighbor_action != 0u) {
                 let neighbor_direction = neighbor_action & 7u; // Extract first 3 bits (now 0-5)
                 
                 // Calculate where the neighbor is attacking using hex grid
@@ -143,7 +186,35 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             new_empire_id = claiming_empire;
             new_strength = 128u; // Default strength for new cells
             new_need = 64u;     // Default need for new cells
-            new_action = 0u;    // No action for newly claimed cells
+            
+            // Newly claimed cells should also try to attack in the same frame
+            // Try to find a valid target (not same empire)
+            var chosen_direction = 6u; // Invalid direction initially
+            var attempts = 0u;
+            
+            // Try up to 6 times to find a valid target
+            while (attempts < 6u && chosen_direction >= 6u) {
+                let test_direction = rng_range(global_id.x, global_id.y, frame_data, attempts + 10u, 6u);
+                let target_offset = get_hex_neighbor_offset(test_direction, pos.y);
+                let target_pos = pos + target_offset;
+                let target_cell = get_cell(target_pos);
+                let target_empire = float_to_u8(target_cell.r);
+                
+                // Only attack if target is different empire (including unclaimed = 0)
+                if (target_empire != claiming_empire) {
+                    chosen_direction = test_direction;
+                }
+                attempts++;
+            }
+            
+            // If we found a valid target, set the action
+            if (chosen_direction < 6u) {
+                // Set action: first 3 bits = direction, remaining 5 bits = all 1s (31 = 0b11111)
+                new_action = chosen_direction | (31u << 3u); // direction + strength allocation bits
+            } else {
+                // No valid targets, don't attack
+                new_action = 0u;
+            }
         }
     }
     

@@ -293,7 +293,7 @@ impl EmpireSimulation {
             render_pipeline,
             current_is_a: true,
             frame_count: 0,
-            simulation_speed: 5, // Update every 5 frames
+            simulation_speed: 1, // Update every frame for immediate feedback
             is_paused: false,
             game_size,
             frame_uniform_buffer,
@@ -316,6 +316,11 @@ impl EmpireSimulation {
             0,
             bytemuck::cast_slice(&[self.frame_count]),
         );
+        
+        // Periodic debug output (every 5 seconds at 60fps)
+        if self.frame_count % 300 == 0 {
+            println!("Simulation running... Frame {}", self.frame_count);
+        }
         
         let mut encoder = graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Empire Simulation Compute Encoder"),
@@ -353,7 +358,7 @@ impl EmpireSimulation {
             return; // Out of bounds
         }
         
-        println!("Claiming cell at ({}, {}) for Empire {}", x, y, empire_id);
+        println!("Claiming cell at ({}, {}) for Empire {} (Frame: {})", x, y, empire_id, self.frame_count);
         
         // Create empire cell data (Channel layout: R=Empire ID, G=Strength, B=Need, A=Action)
         let cell_data: [u8; 4] = [
@@ -363,37 +368,32 @@ impl EmpireSimulation {
             0,          // A: Action (no initial action, will be set by compute shader)
         ];
         
-        // Get the current texture (the one we're reading from in the simulation)
-        let current_texture = if self.current_is_a {
-            &self.texture_a
-        } else {
-            &self.texture_b
-        };
-        
-        // Write directly to the current texture using queue.write_texture
-        graphics.queue.write_texture(
-            // Destination
-            wgpu::TexelCopyTextureInfo {
-                texture: current_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: 0 },
-                aspect: wgpu::TextureAspect::All,
-            },
-            // Data
-            &cell_data,
-            // Data layout
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4), // 4 bytes per pixel (Rgba8Unorm)
-                rows_per_image: Some(1), // Single pixel
-            },
-            // Size
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
+        // Write to both textures to ensure the cell persists through ping-pong
+        for texture in [&self.texture_a, &self.texture_b] {
+            graphics.queue.write_texture(
+                // Destination
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                // Data
+                &cell_data,
+                // Data layout
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4), // 4 bytes per pixel (Rgba8Unorm)
+                    rows_per_image: Some(1), // Single pixel
+                },
+                // Size
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         
         println!("  -> Successfully claimed cell for Empire {}", empire_id);
     }
@@ -401,6 +401,65 @@ impl EmpireSimulation {
     pub fn toggle_pause(&mut self) {
         self.is_paused = !self.is_paused;
         println!("Simulation {}", if self.is_paused { "paused" } else { "resumed" });
+    }
+    
+    // Debug function to test RNG - simulates the WGSL RNG algorithm in Rust
+    pub fn test_rng() {
+        println!("=== Testing RNG Function ===");
+        
+        // PCG hash function (matching WGSL implementation)
+        fn pcg_hash(x: u32, y: u32, frame: u32) -> u32 {
+            let mut state = x ^ (y << 16) ^ (frame << 8);
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state ^= state >> 16;
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state ^= state >> 16;
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        }
+        
+        // RNG range function (matching WGSL implementation)
+        fn rng_range(x: u32, y: u32, frame: u32, seed_offset: u32, max_value: u32) -> u32 {
+            let hash = pcg_hash(x, y, frame + seed_offset);
+            hash % max_value
+        }
+        
+        // Test the RNG with various inputs
+        println!("Testing RNG for different positions and frames:");
+        
+        // Test same position, different frames
+        println!("Position (10, 10) across frames:");
+        for frame in 0..10 {
+            let direction = rng_range(10, 10, frame, 0, 6);
+            print!("{} ", direction);
+        }
+        println!();
+        
+        // Test same frame, different positions
+        println!("Frame 5 across positions:");
+        for pos in 0..10 {
+            let direction = rng_range(pos, pos, 5, 0, 6);
+            print!("{} ", direction);
+        }
+        println!();
+        
+        // Test distribution over many samples
+        let mut counts = [0; 6];
+        let sample_count = 1000;
+        for i in 0..sample_count {
+            let x = i % 32;
+            let y = i / 32;
+            let direction = rng_range(x, y, 100, 0, 6);
+            counts[direction as usize] += 1;
+        }
+        
+        println!("Distribution test over {} samples:", sample_count);
+        for (i, count) in counts.iter().enumerate() {
+            let percentage = (*count as f32 / sample_count as f32) * 100.0;
+            println!("  Direction {}: {} ({:.1}%)", i, count, percentage);
+        }
+        
+        println!("=== RNG Test Complete ===\n");
     }
     
     pub fn render(&self, render_pass: &mut wgpu::RenderPass, vertex_buffer: &wgpu::Buffer, camera_bind_group: &wgpu::BindGroup) {
