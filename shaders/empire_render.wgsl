@@ -32,6 +32,58 @@ var t_texture: texture_2d<f32>;
 @group(0) @binding(1)
 var s_texture: sampler;
 
+// Hash function for consistent pseudo-random values based on empire ID
+fn hash_empire_id(id: u32) -> u32 {
+    var x = id;
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = (x >> 16u) ^ x;
+    return x;
+}
+
+// Convert HSV to RGB color space
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let c = v * s;
+    let x = c * (1.0 - abs(((h / 60.0) % 2.0) - 1.0));
+    let m = v - c;
+    
+    var rgb = vec3<f32>(0.0, 0.0, 0.0);
+    
+    if (h >= 0.0 && h < 60.0) {
+        rgb = vec3<f32>(c, x, 0.0);
+    } else if (h >= 60.0 && h < 120.0) {
+        rgb = vec3<f32>(x, c, 0.0);
+    } else if (h >= 120.0 && h < 180.0) {
+        rgb = vec3<f32>(0.0, c, x);
+    } else if (h >= 180.0 && h < 240.0) {
+        rgb = vec3<f32>(0.0, x, c);
+    } else if (h >= 240.0 && h < 300.0) {
+        rgb = vec3<f32>(x, 0.0, c);
+    } else if (h >= 300.0 && h < 360.0) {
+        rgb = vec3<f32>(c, 0.0, x);
+    }
+    
+    return rgb + vec3<f32>(m, m, m);
+}
+
+// Generate consistent empire color based on ID
+fn get_empire_color(empire_id: f32) -> vec3<f32> {
+    if (empire_id == 0.0) {
+        return vec3<f32>(0.0, 0.0, 0.0); // Black for unclaimed (transparent anyway)
+    }
+    
+    // Convert to integer for hashing
+    let id_int = u32(empire_id * 255.0);
+    let hash_val = hash_empire_id(id_int);
+    
+    // Generate HSV values from hash
+    let hue = f32(hash_val % 360u); // Full hue range 0-360
+    let saturation = 0.7 + (f32((hash_val >> 8u) % 30u) / 100.0); // 0.7-1.0 (high saturation, avoid grays)
+    let value = 0.6 + (f32((hash_val >> 16u) % 20u) / 100.0); // 0.6-0.8 (mid-range brightness)
+    
+    return hsv_to_rgb(hue, saturation, value);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Apply hex offset for visual representation  
@@ -60,21 +112,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Minimum alpha of 0.5, maximum of 0.9, scaling with strength
         let strength_alpha = 0.5 + (strength * 0.4);
         
-        // Use need to slightly tint the color (higher need = more intense)
-        let need_intensity = 0.7 + (need * 0.3);
+        // Get empire color based on ID
+        let base_color = get_empire_color(empire_id);
         
-        if (empire_id < 0.004) { // Empire 1 (1/255 ≈ 0.004)
-            // Empire 1 - bright red, intensity based on need
-            return vec4<f32>(1.0 * need_intensity, 0.2, 0.2, strength_alpha);
-        } else if (empire_id < 0.008) { // Empire 2 (2/255 ≈ 0.008)
-            // Empire 2 - bright blue
-            return vec4<f32>(0.2, 0.2, 1.0 * need_intensity, strength_alpha);
-        } else if (empire_id < 0.012) { // Empire 3 (3/255 ≈ 0.012)
-            // Empire 3 - bright green
-            return vec4<f32>(0.2, 1.0 * need_intensity, 0.2, strength_alpha);
-        } else {
-            // Other empires - yellow
-            return vec4<f32>(1.0 * need_intensity, 1.0 * need_intensity, 0.2, strength_alpha);
-        }
+        // Use need to slightly intensify the color (higher need = more intense)
+        let need_intensity = 0.8 + (need * 0.2);
+        let final_color = base_color * need_intensity;
+        
+        return vec4<f32>(final_color, strength_alpha);
     }
 }

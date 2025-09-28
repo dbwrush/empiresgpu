@@ -104,22 +104,57 @@ impl EmpireSimulation {
             requested_size
         };
         
+        // Generate terrain data first
+        let terrain_data = generate_terrain_data(game_size);
+        
         println!("Creating Empire simulation textures with size {}x{}...", game_size, game_size);
         
-        // Initialize with empty empire map (all cells unclaimed)
+        // Generate initial empire map with random empires on land cells
         let mut initial_data = Vec::new();
-        for _y in 0..game_size {
-            for _x in 0..game_size {
+        let mut empire_id_counter = 1u8; // Start from 1 since 0 means unclaimed
+        let empire_spawn_chance = 0.005; // 0.5% chance per land cell
+        
+        // Use a simple RNG for spawning (we can make this more sophisticated later)
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        for y in 0..game_size {
+            for x in 0..game_size {
                 // Channel layout: R=Empire ID, G=Strength, B=Need, A=Action
-                // All cells start unclaimed (Empire ID = 0)
+                
+                // Check if this is a land cell (elevation > ocean cutoff)
+                let terrain_idx = ((y * game_size + x) * 4) as usize;
+                let elevation = terrain_data[terrain_idx] as f32 / 255.0;
+                let is_land = elevation > 0.53; // Same ocean cutoff as terrain generation
+                
+                let (empire_id, strength) = if is_land {
+                    // Calculate pseudo-random value for this cell
+                    let mut hasher = DefaultHasher::new();
+                    (x, y, 12345u32).hash(&mut hasher); // Include seed for consistency
+                    let random_val = (hasher.finish() % 1000) as f32 / 1000.0;
+                    
+                    if random_val < empire_spawn_chance && empire_id_counter < 255 {
+                        let id = empire_id_counter;
+                        empire_id_counter += 1;
+                        println!("  -> Spawning Empire {} at ({}, {})", id, x, y);
+                        (id, 200u8) // Start with 200 strength
+                    } else {
+                        (0u8, 0u8) // Unclaimed
+                    }
+                } else {
+                    (0u8, 0u8) // Ocean cells remain unclaimed
+                };
+                
                 initial_data.extend_from_slice(&[
-                    0u8,   // R: Empire ID (0 = unclaimed)
-                    0u8,   // G: Strength (0 for unclaimed cells)
-                    0u8,   // B: Need (0 for unclaimed cells)
-                    0u8,   // A: Action (0 = no action)
+                    empire_id, // R: Empire ID
+                    strength,  // G: Strength
+                    0u8,       // B: Need (starts at 0)
+                    0u8,       // A: Action (no action)
                 ]);
             }
         }
+        
+        println!("  -> Spawned {} empires total", empire_id_counter - 1);
         
         // Create two identical textures for ping-pong
         let texture_desc = wgpu::TextureDescriptor {
@@ -148,8 +183,7 @@ impl EmpireSimulation {
         
         let texture_b = graphics.device.create_texture(&texture_desc);
         
-        // Generate and create terrain texture (read-only)
-        let terrain_data = generate_terrain_data(game_size);
+        // Create terrain texture (read-only) using previously generated data
         let terrain_texture_desc = wgpu::TextureDescriptor {
             label: Some("Terrain Texture"),
             size: wgpu::Extent3d {

@@ -267,7 +267,7 @@ fn main() {
     println!("  WASD - Move camera around");
     println!("  Q/E - Zoom out/in");
     println!("  F3 - Toggle FPS overlay");
-    println!("  Left Click - Claim territory for Empire 1 (Red)");
+    println!("  Left Click - Claim territory for Empire 1 (unique color)");
     println!("  Right Click - Unclaim territory");
     println!("  ESC - Exit");
     
