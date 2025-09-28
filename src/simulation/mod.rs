@@ -2,48 +2,72 @@ use wgpu::util::DeviceExt;
 use crate::graphics::{GraphicsContext, load_shader};
 use noise::{NoiseFn, Simplex};
 
-// Generate terrain data using simplex noise
+// Generate terrain data using simplex noise with cylindrical world wrapping
 fn generate_terrain_data(size: u32) -> Vec<u8> {
-    println!("Generating terrain data with simplex noise...");
+    println!("Generating terrain data with cylindrical world wrapping...");
     
-    let altitude_noise = Simplex::new(12345);
-    let humidity_noise = Simplex::new(67890);
-    let temperature_noise = Simplex::new(54321);
+    // Multiple noise layers for varied terrain
+    let noise = Simplex::new(12345);
+    let noise2 = Simplex::new(67890);
+    let noise3 = Simplex::new(54321);
     
     let mut terrain_data = Vec::with_capacity((size * size * 4) as usize);
     
-    let scale = 0.01; // Noise scale - smaller values = larger features
+    // Parameters for world wrapping
+    let loop_dist = size / 16; // Distance from edge where wrapping interpolation occurs
+    let _ocean_cutoff = 0.53; // Terrain below this becomes ocean (used in shaders)
     
     for y in 0..size {
         for x in 0..size {
-            let fx = x as f64 * scale;
-            let fy = y as f64 * scale;
+            let mut elevation = get_elevation(&noise, &noise2, &noise3, x, y, size);
             
-            // Generate altitude (0-255, higher = mountains, lower = sea level)
-            let altitude = ((altitude_noise.get([fx, fy]) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0) as u8;
+            // Apply cylindrical world wrapping at edges
+            if x < loop_dist || x > size - loop_dist {
+                let opp_prop = if x < loop_dist {
+                    x as f32 / loop_dist as f32 * -0.5 + 0.5
+                } else {
+                    (size - x - 1) as f32 / loop_dist as f32 * -0.5 + 0.5
+                };
+                
+                let opp_x = size - x - 1;
+                let opp_elevation = get_elevation(&noise, &noise2, &noise3, opp_x, y, size);
+                elevation = elevation * (1.0 - opp_prop) + opp_elevation * opp_prop;
+            }
             
-            // Generate humidity (0-255, higher = more humid)
-            // Add some correlation with altitude (mountains tend to be less humid)
-            let base_humidity = ((humidity_noise.get([fx * 1.5, fy * 1.5]) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
-            let altitude_factor = 1.0 - (altitude as f64 / 255.0) * 0.3; // Reduce humidity at high altitudes
-            let humidity = (base_humidity * altitude_factor).clamp(0.0, 255.0) as u8;
+            // Store elevation directly as 0-255, let shader handle ocean cutoff
+            let altitude = (elevation * 255.0).clamp(0.0, 255.0) as u8;
             
-            // Generate temperature (0-255, higher = warmer)
-            // Add some correlation with altitude (mountains tend to be colder)
-            let base_temperature = ((temperature_noise.get([fx * 0.8, fy * 0.8]) + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0);
-            let temp_altitude_factor = 1.0 - (altitude as f64 / 255.0) * 0.4; // Reduce temperature at high altitudes
-            let temperature = (base_temperature * temp_altitude_factor).clamp(0.0, 255.0) as u8;
-            
-            // Store as RGBA: R=altitude, G=humidity, B=temperature, A=unused
+            // Store as RGBA: R=altitude, G=unused, B=unused, A=255 (full alpha)
             terrain_data.push(altitude);
-            terrain_data.push(humidity);
-            terrain_data.push(temperature);
-            terrain_data.push(255u8); // Alpha channel (unused)
+            terrain_data.push(0u8); // Unused channel
+            terrain_data.push(0u8); // Unused channel  
+            terrain_data.push(255u8); // Full alpha
         }
     }
     
-    println!("Terrain generation complete!");
+    println!("Terrain generation complete with cylindrical wrapping!");
     terrain_data
+}
+
+fn get_elevation(noise: &Simplex, noise2: &Simplex, noise3: &Simplex, x: u32, y: u32, _size: u32) -> f32 {
+    let mut x_coord = x as f32;
+    
+    // Apply hex grid offset for odd rows
+    if y % 2 == 1 {
+        x_coord += 0.5;
+    }
+    
+    // Multiple octaves of noise for detailed terrain
+    let mut e = noise.get([x_coord as f64 / 128.0, y as f64 / 128.0]) as f32 * 16.0 + 
+                noise.get([x_coord as f64 / 64.0, y as f64 / 64.0]) as f32 * 8.0 + 
+                noise2.get([x_coord as f64 / 32.0, y as f64 / 32.0]) as f32 * 4.0 + 
+                noise3.get([x_coord as f64 / 16.0, y as f64 / 16.0]) as f32 * 2.0 + 
+                noise3.get([x_coord as f64 / 8.0, y as f64 / 8.0]) as f32;
+    
+    e /= 64.0; // Normalize
+    e += 0.5;  // Shift to 0-1 range
+    
+    e.clamp(0.0, 1.0)
 }
 
 pub struct EmpireSimulation {

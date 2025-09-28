@@ -48,15 +48,15 @@ fn get_cell(pos: vec2<i32>) -> vec4<f32> {
 }
 
 // Get terrain data at position with wrapping
-// Returns vec3<f32> with (altitude, humidity, temperature) normalized to [0,1]
-fn get_terrain(pos: vec2<i32>) -> vec3<f32> {
+// Returns vec4<f32> with (altitude, unused, unused, alpha) normalized to [0,1]
+fn get_terrain(pos: vec2<i32>) -> vec4<f32> {
     let dims = textureDimensions(terrain_texture);
     let wrapped_pos = vec2<i32>(
         (pos.x + i32(dims.x)) % i32(dims.x),
         (pos.y + i32(dims.y)) % i32(dims.y)
     );
     let terrain_data = textureLoad(terrain_texture, wrapped_pos, 0);
-    return terrain_data.rgb; // altitude, humidity, temperature
+    return terrain_data; // altitude, terrain_type, unused, ocean_cutoff
 }
 
 // Convert float [0,1] to u8 [0,255]
@@ -134,19 +134,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let need = float_to_u8(current_cell.b);
     let action = float_to_u8(current_cell.a);
     
-    // Read terrain data (for testing - will be used for AI decisions later)
+    // Read terrain data (for AI decisions and water detection)
     let terrain = get_terrain(pos);
-    let altitude = terrain.r;   // 0.0 to 1.0
-    let humidity = terrain.g;   // 0.0 to 1.0  
-    let temperature = terrain.b; // 0.0 to 1.0
+    let altitude = terrain.r;      // 0.0 to 1.0 (elevation)
+    
+    // Fixed ocean cutoff (matching empiresbevy's approach)
+    let ocean_cutoff = 0.53;
+    
+    // Check if this is water (below ocean cutoff)
+    let is_water = altitude < ocean_cutoff;
     
     var new_empire_id = empire_id;
     var new_strength = strength;
     var new_need = need;
     var new_action = action;
     
-    // If this cell belongs to an empire (empire_id != 0), it will try to spread
-    if (empire_id != 0u) {
+    // If this is water, clear any empire presence
+    if (is_water) {
+        new_empire_id = 0u;
+        new_strength = 0u;
+        new_need = 0u;
+        new_action = 0u;
+    }
+    // If this cell belongs to an empire (empire_id != 0) and is on land, it will try to spread
+    else if (empire_id != 0u) {
         // Try to find a valid target (not same empire)
         var chosen_direction = 6u; // Invalid direction initially
         var attempts = 0u;
@@ -159,8 +170,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let target_cell = get_cell(target_pos);
             let target_empire = float_to_u8(target_cell.r);
             
-            // Only attack if target is different empire (including unclaimed = 0)
-            if (target_empire != empire_id) {
+            // Check if target is water
+            let target_terrain = get_terrain(target_pos);
+            let target_is_water = target_terrain.r < 0.53;
+            
+            // Only attack if target is different empire, on land, and not water
+            if (target_empire != empire_id && !target_is_water) {
                 chosen_direction = test_direction;
             }
             attempts++;
