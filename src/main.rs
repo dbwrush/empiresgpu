@@ -2,6 +2,7 @@
 // Goal: Implement Conway's Game of Life using compute shaders and ping-pong textures
 
 use std::sync::Arc;
+use std::collections::HashSet;
 use winit::{
     application::ApplicationHandler,
     event::{WindowEvent, ElementState, MouseButton},
@@ -41,6 +42,18 @@ struct State {
     
     // Game world properties
     game_size: u32,
+    
+    // Camera system
+    camera_x: f32,        // Camera position in world coordinates
+    camera_y: f32,
+    zoom_level: f32,      // Zoom factor (1.0 = normal, 2.0 = 2x zoom, 0.5 = zoomed out)
+    
+    // Input state
+    keys_pressed: std::collections::HashSet<winit::keyboard::KeyCode>,
+    
+    // Camera system buffers
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
 }
 
 #[repr(C)]
@@ -371,14 +384,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             ],
         });
         
-        // Create vertex buffer for a fullscreen quad
+        // Create vertex buffer for the simulation quad in world coordinates
+        let sim_size = game_size as f32;
         let vertices = [
-            Vertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] }, // Bottom-left
-            Vertex { position: [ 1.0, -1.0], tex_coords: [1.0, 1.0] }, // Bottom-right
-            Vertex { position: [ 1.0,  1.0], tex_coords: [1.0, 0.0] }, // Top-right
-            Vertex { position: [-1.0, -1.0], tex_coords: [0.0, 1.0] }, // Bottom-left
-            Vertex { position: [ 1.0,  1.0], tex_coords: [1.0, 0.0] }, // Top-right
-            Vertex { position: [-1.0,  1.0], tex_coords: [0.0, 0.0] }, // Top-left
+            Vertex { position: [0.0, sim_size], tex_coords: [0.0, 1.0] }, // Bottom-left
+            Vertex { position: [sim_size, sim_size], tex_coords: [1.0, 1.0] }, // Bottom-right
+            Vertex { position: [sim_size, 0.0], tex_coords: [1.0, 0.0] }, // Top-right
+            Vertex { position: [0.0, sim_size], tex_coords: [0.0, 1.0] }, // Bottom-left
+            Vertex { position: [sim_size, 0.0], tex_coords: [1.0, 0.0] }, // Top-right
+            Vertex { position: [0.0, 0.0], tex_coords: [0.0, 0.0] }, // Top-left
         ];
         
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -387,11 +401,52 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             usage: wgpu::BufferUsages::VERTEX,
         });
         
-        // Create shader for textured quad
+        // Create camera uniform buffer
+        let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera Uniform Buffer"),
+            size: 64, // mat4x4<f32> = 16 floats * 4 bytes = 64 bytes
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Create camera bind group layout
+        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Camera Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        // Create camera bind group
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Camera Bind Group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        // Create shader for textured quad with camera support
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Texture Shader"),
             source: wgpu::ShaderSource::Wgsl(
                 r#"
+// Camera uniform buffer
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+}
+
+@group(1) @binding(0)
+var<uniform> camera: CameraUniform;
+
 // Vertex shader
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -406,7 +461,8 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    out.clip_position = vec4<f32>(in.position, 0.0, 1.0);
+    // Transform vertex position by camera matrix
+    out.clip_position = camera.view_proj * vec4<f32>(in.position, 0.0, 1.0);
     out.tex_coords = in.tex_coords;
     return out;
 }
@@ -429,7 +485,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             label: Some("Game of Life Render Pipeline"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Game of Life Pipeline Layout"),
-                bind_group_layouts: &[&display_bind_group_layout],
+                bind_group_layouts: &[&display_bind_group_layout, &camera_bind_group_layout],
                 push_constant_ranges: &[],
             })),
             vertex: wgpu::VertexState {
@@ -504,6 +560,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             simulation_speed: 5, // Update every 5 frames
             is_paused: false,
             game_size,
+            // Camera system - start showing the full simulation
+            camera_x: 0.0,
+            camera_y: 0.0,
+            zoom_level: 0.5, // Start zoomed out to see the full simulation
+            keys_pressed: HashSet::new(),
+            camera_uniform_buffer,
+            camera_bind_group,
         }
     }
 
@@ -517,6 +580,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Handle camera input (using fixed timestep for now)
+        let dt = 1.0 / 60.0; // Assume 60 FPS
+        self.handle_camera_input(dt);
+        
+        // Update camera matrix
+        self.update_camera();
+        
         // Update simulation every few frames (only if not paused)
         if !self.is_paused {
             self.frame_count += 1;
@@ -540,9 +610,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
+                            r: 0.1,  // Dark gray background so we can see the simulation area
+                            g: 0.1,
+                            b: 0.1,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -564,6 +634,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             };
             
             render_pass.set_bind_group(0, display_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.camera_bind_group, &[]); // Add camera bind group
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.draw(0..6, 0..1);
         }
@@ -662,20 +733,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         println!("  -> Successfully modified cell using wgpu 26.0 queue.write_texture API");
     }
     
-    // Convert screen coordinates to game world coordinates
+    // Convert screen coordinates to game world coordinates using camera transform
     fn screen_to_game_coords(&self, screen_x: f64, screen_y: f64) -> Option<(u32, u32)> {
         let window_width = self.size.width as f64;
         let window_height = self.size.height as f64;
+        let aspect_ratio = window_width / window_height;
         
-        // Convert screen coordinates to texture coordinates (0.0 to 1.0)
-        let tex_x = screen_x / window_width;
-        let tex_y = screen_y / window_height;
+        // Convert screen coordinates to normalized device coordinates (-1 to 1)
+        let ndc_x = (screen_x / window_width) * 2.0 - 1.0;
+        let ndc_y = 1.0 - (screen_y / window_height) * 2.0; // Flip Y for screen coordinates
         
-        // Convert to game coordinates
-        if tex_x >= 0.0 && tex_x <= 1.0 && tex_y >= 0.0 && tex_y <= 1.0 {
-            let game_x = (tex_x * self.game_size as f64) as u32;
-            let game_y = (tex_y * self.game_size as f64) as u32;
-            Some((game_x, game_y))
+        // Calculate the view bounds (same as in update_camera)
+        let view_width = (self.game_size as f64) / (self.zoom_level as f64);
+        let view_height = view_width / aspect_ratio;
+        
+        // Calculate the bounds of what we're seeing in world coordinates
+        let left = (self.camera_x as f64) - view_width * 0.5;
+        let right = (self.camera_x as f64) + view_width * 0.5;
+        let bottom = (self.camera_y as f64) + view_height * 0.5;
+        let top = (self.camera_y as f64) - view_height * 0.5;
+        
+        // Convert NDC to world coordinates using the same bounds as the camera
+        let world_x = left + (ndc_x + 1.0) * 0.5 * (right - left);
+        let world_y = bottom + (ndc_y + 1.0) * 0.5 * (top - bottom); // Fixed: use bottom + ... instead of top + ...
+        
+        println!("Mouse: screen=({:.1}, {:.1}) ndc=({:.3}, {:.3}) world=({:.1}, {:.1})", 
+                screen_x, screen_y, ndc_x, ndc_y, world_x, world_y);
+        
+        // Check if coordinates are within the simulation bounds
+        if world_x >= 0.0 && world_x < self.game_size as f64 && 
+           world_y >= 0.0 && world_y < self.game_size as f64 {
+            Some((world_x as u32, world_y as u32))
         } else {
             None
         }
@@ -684,6 +772,76 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     fn toggle_pause(&mut self) {
         self.is_paused = !self.is_paused;
         println!("Simulation {}", if self.is_paused { "paused" } else { "resumed" });
+    }
+    
+    fn update_camera(&mut self) {
+        // Calculate proper orthographic projection matrix
+        let aspect_ratio = self.size.width as f32 / self.size.height as f32;
+        
+        // Calculate the view bounds based on camera position and zoom
+        let view_width = (self.game_size as f32) / self.zoom_level;
+        let view_height = view_width / aspect_ratio;
+        
+        // Calculate the bounds of what we want to see in world coordinates
+        let left = self.camera_x - view_width * 0.5;
+        let right = self.camera_x + view_width * 0.5;
+        let bottom = self.camera_y + view_height * 0.5; // Note: in our coordinate system, Y increases downward
+        let top = self.camera_y - view_height * 0.5;
+        
+        // Create orthographic projection matrix that maps [left, right] x [bottom, top] to [-1, 1] x [-1, 1]
+        let width = right - left;
+        let height = top - bottom;
+        
+        // Orthographic projection matrix (column-major for WGSL)
+        #[rustfmt::skip]
+        let matrix = [
+            2.0 / width, 0.0, 0.0, 0.0,                    // Column 0
+            0.0, 2.0 / height, 0.0, 0.0,                   // Column 1  
+            0.0, 0.0, 1.0, 0.0,                            // Column 2
+            -(right + left) / width, -(top + bottom) / height, 0.0, 1.0,  // Column 3
+        ];
+        
+        // Update the uniform buffer
+        self.queue.write_buffer(
+            &self.camera_uniform_buffer,
+            0,
+            bytemuck::cast_slice(&matrix),
+        );
+    }
+    
+    fn handle_camera_input(&mut self, dt: f32) {
+        let camera_speed = 50.0 / self.zoom_level; // Move slower when zoomed in (reduced speed)
+        let zoom_speed = 1.0; // Reduced zoom speed
+        
+        // WASD movement
+        if self.keys_pressed.contains(&KeyCode::KeyW) {
+            self.camera_y -= camera_speed * dt;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyS) {
+            self.camera_y += camera_speed * dt;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyA) {
+            self.camera_x -= camera_speed * dt;
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyD) {
+            self.camera_x += camera_speed * dt;
+        }
+        
+        // Q/E zoom
+        if self.keys_pressed.contains(&KeyCode::KeyQ) {
+            self.zoom_level *= 1.0 + zoom_speed * dt; // Zoom out
+            if self.zoom_level > 10.0 { self.zoom_level = 10.0; }
+        }
+        if self.keys_pressed.contains(&KeyCode::KeyE) {
+            self.zoom_level *= 1.0 - zoom_speed * dt; // Zoom in
+            if self.zoom_level < 0.1 { self.zoom_level = 0.1; }
+        }
+        
+        // Keep camera within reasonable bounds
+        let game_size = self.game_size as f32;
+        let margin = game_size * 0.5; // Allow camera to go a bit outside the simulation
+        self.camera_x = self.camera_x.clamp(-margin, game_size + margin);
+        self.camera_y = self.camera_y.clamp(-margin, game_size + margin);
     }
 }
 
@@ -718,18 +876,35 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             },
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Escape) => {
-                            println!("Escape pressed, exiting...");
-                            event_loop.exit();
-                        },
-                        PhysicalKey::Code(KeyCode::Space) => {
-                            if let Some(state) = &mut self.state {
-                                state.toggle_pause();
+                if let PhysicalKey::Code(key_code) = event.physical_key {
+                    match event.state {
+                        ElementState::Pressed => {
+                            match key_code {
+                                KeyCode::Escape => {
+                                    println!("Escape pressed, exiting...");
+                                    event_loop.exit();
+                                },
+                                KeyCode::Space => {
+                                    if let Some(state) = &mut self.state {
+                                        state.toggle_pause();
+                                    }
+                                },
+                                KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD |
+                                KeyCode::KeyQ | KeyCode::KeyE => {
+                                    // Track camera movement keys
+                                    if let Some(state) = &mut self.state {
+                                        state.keys_pressed.insert(key_code);
+                                    }
+                                },
+                                _ => {}
                             }
                         },
-                        _ => {}
+                        ElementState::Released => {
+                            // Remove key from pressed set
+                            if let Some(state) = &mut self.state {
+                                state.keys_pressed.remove(&key_code);
+                            }
+                        }
                     }
                 }
             },
@@ -779,9 +954,11 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    println!("EmpiresGPU: Conway's Game of Life GPU Simulation");
+    println!("EmpiresGPU: Conway's Game of Life GPU Simulation with Camera System");
     println!("Controls:");
     println!("  SPACE - Pause/Resume simulation");
+    println!("  WASD - Move camera around");
+    println!("  Q/E - Zoom out/in");
     println!("  Left Click - Make cell alive");
     println!("  Right Click - Make cell dead");
     println!("  ESC - Exit");
