@@ -11,6 +11,8 @@ use winit::{
     window::{Window, WindowId},
 };
 use wgpu::util::DeviceExt;
+use glyph_brush::ab_glyph::FontRef;
+use glyph_brush::{Section, Text};
 
 struct State {
     surface: wgpu::Surface<'static>,
@@ -54,6 +56,14 @@ struct State {
     // Camera system buffers
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    
+    // FPS tracking and text overlay
+    fps_visible: bool,
+    frame_times: Vec<std::time::Instant>,
+    last_fps_update: std::time::Instant,
+    current_fps: f32,
+    fps_1_percent_low: f32,
+    text_brush: Option<wgpu_text::TextBrush<glyph_brush::ab_glyph::FontRef<'static>>>,
 }
 
 #[repr(C)]
@@ -539,7 +549,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         });
         
         println!("Game of Life pipeline created! Ready to simulate.");
+        
+        // Create text rendering system using wgpu_text
+        println!("Creating text rendering system...");
+        let font_data = include_bytes!("../assets/fonts/DejaVuSans.ttf");
+        let text_brush = wgpu_text::BrushBuilder::using_font_bytes(font_data)
+            .unwrap()
+            .build(&device, config.width, config.height, config.format);
+        println!("Text rendering system created successfully!");
 
+        let now = std::time::Instant::now();
+        
         Self {
             surface,
             device,
@@ -567,6 +587,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             keys_pressed: HashSet::new(),
             camera_uniform_buffer,
             camera_bind_group,
+            // FPS tracking
+            fps_visible: true,
+            frame_times: Vec::with_capacity(120), // Store up to 120 frame times (2 seconds at 60fps)
+            last_fps_update: now,
+            current_fps: 0.0,
+            fps_1_percent_low: 0.0,
+            text_brush: Some(text_brush),
         }
     }
 
@@ -576,10 +603,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            
+            // Update text brush for new size
+            if let Some(text_brush) = &mut self.text_brush {
+                text_brush.resize_view(new_size.width as f32, new_size.height as f32, &self.queue);
+            }
         }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Update FPS tracking
+        self.update_fps_tracking();
+        
         // Handle camera input (using fixed timestep for now)
         let dt = 1.0 / 60.0; // Assume 60 FPS
         self.handle_camera_input(dt);
@@ -637,6 +672,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]); // Add camera bind group
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.draw(0..6, 0..1);
+            
+            // Render FPS overlay if visible
+            if self.fps_visible {
+                if let Some(text_brush) = &mut self.text_brush {
+                    let fps_text = format!("{:.1} / {:.1}", self.current_fps, self.fps_1_percent_low);
+                    
+                    let section = Section::default()
+                        .add_text(Text::new(&fps_text).with_scale(20.0).with_color([1.0, 1.0, 1.0, 1.0]))
+                        .with_screen_position((10.0, 10.0));
+                    
+                    match text_brush.queue(&self.device, &self.queue, [&section]) {
+                        Ok(_) => {
+                            text_brush.draw(&mut render_pass);
+                        },
+                        Err(e) => {
+                            eprintln!("Text rendering error: {:?}", e);
+                        }
+                    }
+                }
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -733,6 +788,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         println!("  -> Successfully modified cell using wgpu 26.0 queue.write_texture API");
     }
     
+    // ⚠️ WARNING: MOUSE COORDINATE SYSTEM IS WORKING PERFECTLY - DO NOT MODIFY! ⚠️
+    // This coordinate conversion is correctly synchronized with the camera matrix
     // Convert screen coordinates to game world coordinates using camera transform
     fn screen_to_game_coords(&self, screen_x: f64, screen_y: f64) -> Option<(u32, u32)> {
         let window_width = self.size.width as f64;
@@ -757,9 +814,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let world_x = left + (ndc_x + 1.0) * 0.5 * (right - left);
         let world_y = bottom + (ndc_y + 1.0) * 0.5 * (top - bottom); // Fixed: use bottom + ... instead of top + ...
         
-        println!("Mouse: screen=({:.1}, {:.1}) ndc=({:.3}, {:.3}) world=({:.1}, {:.1})", 
-                screen_x, screen_y, ndc_x, ndc_y, world_x, world_y);
-        
         // Check if coordinates are within the simulation bounds
         if world_x >= 0.0 && world_x < self.game_size as f64 && 
            world_y >= 0.0 && world_y < self.game_size as f64 {
@@ -774,6 +828,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         println!("Simulation {}", if self.is_paused { "paused" } else { "resumed" });
     }
     
+    // ⚠️ WARNING: CAMERA SYSTEM IS WORKING PERFECTLY - DO NOT MODIFY! ⚠️
+    // This camera matrix calculation is correct and matches the mouse coordinate conversion
     fn update_camera(&mut self) {
         // Calculate proper orthographic projection matrix
         let aspect_ratio = self.size.width as f32 / self.size.height as f32;
@@ -843,6 +899,48 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         self.camera_x = self.camera_x.clamp(-margin, game_size + margin);
         self.camera_y = self.camera_y.clamp(-margin, game_size + margin);
     }
+    
+    fn update_fps_tracking(&mut self) {
+        let now = std::time::Instant::now();
+        
+        // Add current frame time
+        self.frame_times.push(now);
+        
+        // Remove old frame times (keep only last 2 seconds worth)
+        let cutoff_time = now - std::time::Duration::from_secs(2);
+        self.frame_times.retain(|&time| time > cutoff_time);
+        
+        // Update FPS calculations every 0.25 seconds
+        if now.duration_since(self.last_fps_update).as_secs_f32() > 0.25 {
+            if self.frame_times.len() > 1 {
+                // Calculate average FPS
+                let total_duration = now.duration_since(self.frame_times[0]).as_secs_f32();
+                self.current_fps = (self.frame_times.len() - 1) as f32 / total_duration;
+                
+                // Calculate 1% low (99th percentile of frame times)
+                let mut frame_durations: Vec<f32> = Vec::new();
+                for i in 1..self.frame_times.len() {
+                    let duration = self.frame_times[i].duration_since(self.frame_times[i-1]).as_secs_f32();
+                    frame_durations.push(duration);
+                }
+                
+                if !frame_durations.is_empty() {
+                    frame_durations.sort_by(|a, b| b.partial_cmp(a).unwrap()); // Sort descending
+                    let percentile_99_index = ((frame_durations.len() as f32 * 0.01).ceil() as usize).min(frame_durations.len() - 1);
+                    let slowest_1_percent_duration = frame_durations[percentile_99_index];
+                    self.fps_1_percent_low = 1.0 / slowest_1_percent_duration;
+                }
+            }
+            self.last_fps_update = now;
+        }
+    }
+    
+    fn toggle_fps_overlay(&mut self) {
+        self.fps_visible = !self.fps_visible;
+        println!("FPS overlay {}", if self.fps_visible { "enabled" } else { "disabled" });
+    }
+    
+    // TODO: Implement proper text rendering using wgpu_text crate
 }
 
 struct App {
@@ -887,6 +985,11 @@ impl ApplicationHandler for App {
                                 KeyCode::Space => {
                                     if let Some(state) = &mut self.state {
                                         state.toggle_pause();
+                                    }
+                                },
+                                KeyCode::F3 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.toggle_fps_overlay();
                                     }
                                 },
                                 KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD |
@@ -959,6 +1062,7 @@ fn main() {
     println!("  SPACE - Pause/Resume simulation");
     println!("  WASD - Move camera around");
     println!("  Q/E - Zoom out/in");
+    println!("  F3 - Toggle FPS overlay");
     println!("  Left Click - Make cell alive");
     println!("  Right Click - Make cell dead");
     println!("  ESC - Exit");

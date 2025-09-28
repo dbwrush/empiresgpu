@@ -9,3 +9,6 @@ winit = "0.30"
 wgpu = "26.0"
 pollster = "0.4"  # For blocking on async GPU operations
 bytemuck = { version = "1.23", features = ["derive"] }  # For vertex buffer casting
+wgpu_text = "26.0.0"
+ab_glyph = "0.2.31"
+glyph_brush = "0.7.12"
