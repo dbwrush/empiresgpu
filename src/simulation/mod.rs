@@ -19,9 +19,20 @@ pub struct EmpireSimulation {
 }
 
 impl EmpireSimulation {
-    pub fn new(graphics: &GraphicsContext, camera_bind_group_layout: &wgpu::BindGroupLayout) -> Self {
-        println!("Creating Empire simulation textures...");
-        let game_size = 256u32;
+    pub fn new(graphics: &GraphicsContext, camera_bind_group_layout: &wgpu::BindGroupLayout, requested_size: u32) -> Self {
+        // Check GPU texture size limits and constrain if necessary
+        let max_texture_size = graphics.device.limits().max_texture_dimension_2d;
+        let game_size = if requested_size > max_texture_size {
+            println!("WARNING: Requested simulation size {}x{} exceeds GPU limit of {}x{}", 
+                requested_size, requested_size, max_texture_size, max_texture_size);
+            println!("         Constraining to maximum supported size: {}x{}", max_texture_size, max_texture_size);
+            println!("         For larger simulations, consider using storage buffers instead of textures.");
+            max_texture_size
+        } else {
+            requested_size
+        };
+        
+        println!("Creating Empire simulation textures with size {}x{}...", game_size, game_size);
         
         // Initialize with empty empire map (all cells unclaimed)
         let mut initial_data = Vec::new();
@@ -343,8 +354,10 @@ impl EmpireSimulation {
             
             compute_pass.set_bind_group(0, compute_bind_group, &[]);
             
-            // Dispatch compute shader (256x256 texture with 8x8 workgroups)
-            compute_pass.dispatch_workgroups(32, 32, 1);
+            // Dispatch compute shader with dynamic workgroup count based on texture size
+            // Uses ceiling division to ensure full coverage for any texture size with 8x8 workgroups
+            let workgroup_count = (self.game_size + 8 - 1) / 8;
+            compute_pass.dispatch_workgroups(workgroup_count, workgroup_count, 1);
         }
 
         graphics.queue.submit(std::iter::once(encoder.finish()));

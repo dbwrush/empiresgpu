@@ -69,7 +69,15 @@ impl GraphicsContext {
             .await
             .unwrap();
             
+        // Query and display GPU limits
+        let limits = device.limits();
         println!("GPU Device initialized successfully!");
+        println!("GPU Limits:");
+        println!("  Max texture dimension 2D: {}", limits.max_texture_dimension_2d);
+        println!("  Max texture dimension 3D: {}", limits.max_texture_dimension_3d);
+        println!("  Max compute workgroups per dimension: {}", limits.max_compute_workgroups_per_dimension);
+        println!("  Max compute workgroup size X: {}", limits.max_compute_workgroup_size_x);
+        println!("  Max compute workgroup size Y: {}", limits.max_compute_workgroup_size_y);
         
         // Configure surface
         let surface_caps = surface.get_capabilities(&adapter);

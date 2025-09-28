@@ -20,6 +20,13 @@ use camera::Camera;
 use simulation::EmpireSimulation;
 use ui::FpsTracker;
 
+// Centralized simulation size configuration
+// Change this value to easily adjust the simulation grid size (e.g., 128, 256, 512)
+// The system will automatically handle camera centering, workgroup dispatch, and vertex buffer sizing
+// Note: GPU texture size limits typically cap this at 8192x8192. Larger values will be constrained.
+// For truly large simulations (>8192), see SCALING.md for storage buffer implementation approaches.
+const SIMULATION_SIZE: u32 = 16384;
+
 struct State {
     graphics: GraphicsContext,
     camera: Camera,
@@ -36,16 +43,18 @@ impl State {
         
         // Create camera with bind group layout for the simulation
         let camera_bind_group_layout = Camera::create_bind_group_layout(&graphics.device);
-        let camera = Camera::new(&graphics.device, 256);
         
-        // Create simulation
-        let simulation = EmpireSimulation::new(&graphics, &camera_bind_group_layout);
+        // Create simulation (may constrain size based on GPU limits)
+        let simulation = EmpireSimulation::new(&graphics, &camera_bind_group_layout, SIMULATION_SIZE);
+        
+        // Create camera with the actual simulation size (may be constrained)
+        let camera = Camera::new(&graphics.device, simulation.game_size);
         
         // Create FPS tracker
         let fps_tracker = FpsTracker::new(&graphics.device, &graphics.config);
         
         // Create vertex buffer for rendering
-        let sim_size = 256.0;
+        let sim_size = simulation.game_size as f32;
         let vertices = GraphicsContext::create_quad_vertices(sim_size);
         let vertex_buffer = graphics.create_vertex_buffer(&vertices);
         
