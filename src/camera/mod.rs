@@ -46,8 +46,8 @@ impl Camera {
         });
 
         Self {
-            x: 0.0,
-            y: 0.0,
+            x: _game_size as f32 / 2.0,  // Center horizontally on the map
+            y: _game_size as f32 / 2.0,  // Center vertically on the map
             zoom_level: 0.5, // Start zoomed out to see the full simulation
             keys_pressed: HashSet::new(),
             uniform_buffer,
