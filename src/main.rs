@@ -1,10 +1,10 @@
-// Phase 4: Texture Rendering - Add texture display capabilities
-// Goal: Create and display a test texture to verify texture pipeline
+// Phase 5: Conway's Game of Life - GPU-based cellular automata
+// Goal: Implement Conway's Game of Life using compute shaders and ping-pong textures
 
 use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{WindowEvent, ElementState, MouseButton},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
@@ -19,7 +19,28 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
-    texture_bind_group: wgpu::BindGroup,
+    
+    // Game of Life textures (ping-pong)
+    game_texture_a: wgpu::Texture,
+    game_texture_b: wgpu::Texture,
+    game_bind_group_a: wgpu::BindGroup,
+    game_bind_group_b: wgpu::BindGroup,
+    display_bind_group_a: wgpu::BindGroup,
+    display_bind_group_b: wgpu::BindGroup,
+    
+    // Compute pipeline for Game of Life simulation
+    compute_pipeline: wgpu::ComputePipeline,
+    
+    // Ping-pong state (true = A is current, false = B is current)
+    current_is_a: bool,
+    
+    // Simulation control
+    frame_count: u32,
+    simulation_speed: u32, // Skip frames between updates
+    is_paused: bool,
+    
+    // Game world properties
+    game_size: u32,
 }
 
 #[repr(C)]
@@ -85,57 +106,220 @@ impl State {
         };
         surface.configure(&device, &config);
         
-        // Create a simple test texture using device utility
-        println!("Creating test texture...");
-        let texture_size = 64u32;
-        let mut texture_data = Vec::new();
+        // Create Game of Life textures (ping-pong buffers)
+        println!("Creating Game of Life textures...");
+        let game_size = 256u32;
         
-        // Generate a simple checkerboard pattern
-        for y in 0..texture_size {
-            for x in 0..texture_size {
-                let checker = ((x / 8) + (y / 8)) % 2;
-                if checker == 0 {
-                    texture_data.extend_from_slice(&[255u8, 0u8, 255u8, 255u8]); // Magenta
+        // Initialize with random pattern
+        let mut initial_data = Vec::new();
+        for y in 0..game_size {
+            for x in 0..game_size {
+                // Create some interesting initial patterns
+                let alive = if x >= 120 && x <= 130 && y >= 120 && y <= 130 {
+                    // Proper glider pattern (moving diagonally down-right)
+                    match (x - 120, y - 120) {
+                        (1, 0) | (2, 1) | (0, 2) | (1, 2) | (2, 2) => true,
+                        _ => false,
+                    }
+                } else if x >= 100 && x <= 110 && y >= 100 && y <= 110 {
+                    // Add a simple blinker (oscillator)
+                    match (x - 100, y - 100) {
+                        (5, 4) | (5, 5) | (5, 6) => true,
+                        _ => false,
+                    }
                 } else {
-                    texture_data.extend_from_slice(&[0u8, 255u8, 255u8, 255u8]); // Cyan
+                    false
+                };
+                
+                if alive {
+                    initial_data.extend_from_slice(&[255u8, 255u8, 255u8, 255u8]); // White = alive
+                } else {
+                    initial_data.extend_from_slice(&[0u8, 0u8, 0u8, 255u8]); // Black = dead
                 }
             }
         }
         
-        let texture = device.create_texture_with_data(
-            &queue,
-            &wgpu::TextureDescriptor {
-                label: Some("Test Texture"),
-                size: wgpu::Extent3d {
-                    width: texture_size,
-                    height: texture_size,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
+        // Create two identical textures for ping-pong
+        let texture_desc = wgpu::TextureDescriptor {
+            label: Some("Game of Life Texture"),
+            size: wgpu::Extent3d {
+                width: game_size,
+                height: game_size,
+                depth_or_array_layers: 1,
             },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm, // Use Unorm instead of UnormSrgb for storage binding
+            usage: wgpu::TextureUsages::TEXTURE_BINDING 
+                | wgpu::TextureUsages::STORAGE_BINDING 
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        
+        let game_texture_a = device.create_texture_with_data(
+            &queue,
+            &texture_desc,
             wgpu::util::TextureDataOrder::LayerMajor,
-            &texture_data,
+            &initial_data,
         );
         
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let game_texture_b = device.create_texture(&texture_desc);
+        
+        // Create texture views
+        let game_view_a = game_texture_a.create_view(&wgpu::TextureViewDescriptor::default());
+        let game_view_b = game_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
+        
         let texture_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         
-        // Create bind group layout for texture
-        let texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Texture Bind Group Layout"),
+        // Create compute shader for Game of Life
+        println!("Creating Game of Life compute pipeline...");
+        let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Game of Life Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+@group(0) @binding(0)
+var input_texture: texture_2d<f32>;
+
+@group(0) @binding(1)
+var output_texture: texture_storage_2d<rgba8unorm, write>;
+
+fn get_cell(pos: vec2<i32>) -> u32 {
+    let dims = textureDimensions(input_texture);
+    let wrapped_pos = vec2<i32>(
+        (pos.x + i32(dims.x)) % i32(dims.x),
+        (pos.y + i32(dims.y)) % i32(dims.y)
+    );
+    let cell = textureLoad(input_texture, wrapped_pos, 0);
+    return u32(cell.r > 0.5);
+}
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let pos = vec2<i32>(i32(global_id.x), i32(global_id.y));
+    let dims = textureDimensions(input_texture);
+    
+    if (pos.x >= i32(dims.x) || pos.y >= i32(dims.y)) {
+        return;
+    }
+    
+    // Count living neighbors
+    var neighbors = 0u;
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            neighbors += get_cell(pos + vec2<i32>(dx, dy));
+        }
+    }
+    
+    let current_cell = get_cell(pos);
+    var new_cell = 0u;
+    
+    // Conway's Game of Life rules
+    if (current_cell == 1u) {
+        // Live cell with 2 or 3 neighbors survives
+        if (neighbors == 2u || neighbors == 3u) {
+            new_cell = 1u;
+        }
+    } else {
+        // Dead cell with exactly 3 neighbors becomes alive
+        if (neighbors == 3u) {
+            new_cell = 1u;
+        }
+    }
+    
+    let color = vec4<f32>(f32(new_cell), f32(new_cell), f32(new_cell), 1.0);
+    textureStore(output_texture, pos, color);
+}
+                "#.into(),
+            ),
+        });
+        
+        // Create compute bind group layout
+        let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Game of Life Compute Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        
+        // Create compute pipeline
+        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Game of Life Compute Pipeline"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Game of Life Compute Pipeline Layout"),
+                bind_group_layouts: &[&compute_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &compute_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        
+        // Create compute bind groups for ping-pong (A -> B and B -> A)
+        let game_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Game Bind Group A->B"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&game_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&game_view_b),
+                },
+            ],
+        });
+        
+        let game_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Game Bind Group B->A"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&game_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&game_view_a),
+                },
+            ],
+        });
+        
+        // Create display bind group layout (for rendering to screen)
+        let display_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Display Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -156,13 +340,29 @@ impl State {
             ],
         });
         
-        let texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Texture Bind Group"),
-            layout: &texture_bind_group_layout,
+        // Create display bind groups
+        let display_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Display Bind Group A"),
+            layout: &display_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                    resource: wgpu::BindingResource::TextureView(&game_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+            ],
+        });
+        
+        let display_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Display Bind Group B"),
+            layout: &display_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&game_view_b),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -226,10 +426,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         });
         
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Texture Render Pipeline"),
+            label: Some("Game of Life Render Pipeline"),
             layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Texture Pipeline Layout"),
-                bind_group_layouts: &[&texture_bind_group_layout],
+                label: Some("Game of Life Pipeline Layout"),
+                bind_group_layouts: &[&display_bind_group_layout],
                 push_constant_ranges: &[],
             })),
             vertex: wgpu::VertexState {
@@ -282,7 +482,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             cache: None,
         });
         
-        println!("Texture render pipeline created! Ready to render.");
+        println!("Game of Life pipeline created! Ready to simulate.");
 
         Self {
             surface,
@@ -292,7 +492,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             size,
             render_pipeline,
             vertex_buffer,
-            texture_bind_group,
+            game_texture_a,
+            game_texture_b,
+            game_bind_group_a,
+            game_bind_group_b,
+            display_bind_group_a,
+            display_bind_group_b,
+            compute_pipeline,
+            current_is_a: true,
+            frame_count: 0,
+            simulation_speed: 5, // Update every 5 frames
+            is_paused: false,
+            game_size,
         }
     }
 
@@ -306,6 +517,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // Update simulation every few frames (only if not paused)
+        if !self.is_paused {
+            self.frame_count += 1;
+            if self.frame_count % self.simulation_speed == 0 {
+                self.update_simulation();
+            }
+        }
+        
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -321,9 +540,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -336,7 +555,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             });
 
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.texture_bind_group, &[]);
+            
+            // Use the current texture for display
+            let display_bind_group = if self.current_is_a {
+                &self.display_bind_group_a
+            } else {
+                &self.display_bind_group_b
+            };
+            
+            render_pass.set_bind_group(0, display_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.draw(0..6, 0..1);
         }
@@ -346,11 +573,124 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         Ok(())
     }
+    
+    fn update_simulation(&mut self) {
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Game of Life Compute Encoder"),
+        });
+
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Game of Life Compute Pass"),
+                timestamp_writes: None,
+            });
+
+            compute_pass.set_pipeline(&self.compute_pipeline);
+            
+            // Use the appropriate bind group for ping-pong
+            let compute_bind_group = if self.current_is_a {
+                &self.game_bind_group_a // A -> B
+            } else {
+                &self.game_bind_group_b // B -> A
+            };
+            
+            compute_pass.set_bind_group(0, compute_bind_group, &[]);
+            
+            // Dispatch compute shader (256x256 texture with 8x8 workgroups)
+            compute_pass.dispatch_workgroups(32, 32, 1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        
+        // Flip ping-pong state
+        self.current_is_a = !self.current_is_a;
+    }
+    
+    // Generic function to modify cell values in the game world
+    // Generic method to modify any cell data on any texture
+    // This can be used for terrain editing, adding forces, spawning empires, etc.
+    fn modify_cell(&mut self, x: u32, y: u32, alive: bool) {
+        if x >= self.game_size || y >= self.game_size {
+            return; // Out of bounds
+        }
+        
+        println!("Modifying cell at ({}, {}) to {}", x, y, if alive { "alive" } else { "dead" });
+        
+        // Create the new cell data (Rgba8Unorm format: R=cell_state, G=B=A=0)
+        let cell_data: [u8; 4] = if alive {
+            [255, 0, 0, 255] // Alive: red pixel (R=255, G=0, B=0, A=255)
+        } else {
+            [0, 0, 0, 255]   // Dead: black pixel (R=0, G=0, B=0, A=255)
+        };
+        
+        // Get the current texture (the one we're reading from in the simulation)
+        let current_texture = if self.current_is_a {
+            &self.game_texture_a
+        } else {
+            &self.game_texture_b
+        };
+        
+        // Write directly to the current texture using queue.write_texture
+        self.queue.write_texture(
+            // Destination - use wgpu 26.0 TexelCopyTextureInfo
+            wgpu::TexelCopyTextureInfo {
+                texture: current_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x,
+                    y,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            // Data
+            &cell_data,
+            // Data layout - use wgpu 26.0 TexelCopyBufferLayout
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4), // 4 bytes per pixel (Rgba8Unorm)
+                rows_per_image: Some(1), // Single pixel
+            },
+            // Size
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        
+        println!("  -> Successfully modified cell using wgpu 26.0 queue.write_texture API");
+    }
+    
+    // Convert screen coordinates to game world coordinates
+    fn screen_to_game_coords(&self, screen_x: f64, screen_y: f64) -> Option<(u32, u32)> {
+        let window_width = self.size.width as f64;
+        let window_height = self.size.height as f64;
+        
+        // Convert screen coordinates to texture coordinates (0.0 to 1.0)
+        let tex_x = screen_x / window_width;
+        let tex_y = screen_y / window_height;
+        
+        // Convert to game coordinates
+        if tex_x >= 0.0 && tex_x <= 1.0 && tex_y >= 0.0 && tex_y <= 1.0 {
+            let game_x = (tex_x * self.game_size as f64) as u32;
+            let game_y = (tex_y * self.game_size as f64) as u32;
+            Some((game_x, game_y))
+        } else {
+            None
+        }
+    }
+    
+    fn toggle_pause(&mut self) {
+        self.is_paused = !self.is_paused;
+        println!("Simulation {}", if self.is_paused { "paused" } else { "resumed" });
+    }
 }
 
 struct App {
     window: Option<Arc<Window>>,
     state: Option<State>,
+    cursor_position: Option<(f64, f64)>,
 }
 
 impl ApplicationHandler for App {
@@ -358,7 +698,7 @@ impl ApplicationHandler for App {
         println!("Creating window...");
         
         let window_attributes = Window::default_attributes()
-            .with_title("EmpiresGPU - Phase 4")
+            .with_title("EmpiresGPU - Conway's Game of Life")
             .with_inner_size(winit::dpi::LogicalSize::new(800, 600));
         
         let window = Arc::new(event_loop.create_window(window_attributes).unwrap());
@@ -378,9 +718,38 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             },
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.physical_key == PhysicalKey::Code(KeyCode::Escape) {
-                    println!("Escape pressed, exiting...");
-                    event_loop.exit();
+                if event.state == ElementState::Pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            println!("Escape pressed, exiting...");
+                            event_loop.exit();
+                        },
+                        PhysicalKey::Code(KeyCode::Space) => {
+                            if let Some(state) = &mut self.state {
+                                state.toggle_pause();
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+            },
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = Some((position.x, position.y));
+            },
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                // Handle left mouse click to add living cells
+                if let (Some(state_ref), Some((cursor_x, cursor_y))) = (&mut self.state, self.cursor_position) {
+                    if let Some((game_x, game_y)) = state_ref.screen_to_game_coords(cursor_x, cursor_y) {
+                        state_ref.modify_cell(game_x, game_y, true);
+                    }
+                }
+            },
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                // Handle right mouse click to remove living cells
+                if let (Some(state_ref), Some((cursor_x, cursor_y))) = (&mut self.state, self.cursor_position) {
+                    if let Some((game_x, game_y)) = state_ref.screen_to_game_coords(cursor_x, cursor_y) {
+                        state_ref.modify_cell(game_x, game_y, false);
+                    }
                 }
             },
             WindowEvent::Resized(physical_size) => {
@@ -410,15 +779,21 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    println!("Phase 4: Testing texture rendering with latest APIs...");
+    println!("EmpiresGPU: Conway's Game of Life GPU Simulation");
+    println!("Controls:");
+    println!("  SPACE - Pause/Resume simulation");
+    println!("  Left Click - Make cell alive");
+    println!("  Right Click - Make cell dead");
+    println!("  ESC - Exit");
     
     let event_loop = EventLoop::new().unwrap();
     let mut app = App {
         window: None,
         state: None,
+        cursor_position: None,
     };
 
-    println!("Starting event loop...");
+    println!("Starting Game of Life simulation...");
     event_loop.run_app(&mut app).unwrap();
-    println!("Event loop finished.");
+    println!("Simulation finished.");
 }
