@@ -209,67 +209,143 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
         
-        // Apply combat resolution (3:1 defender advantage)
+        // Apply combat resolution - DEBUG: More favorable to attackers
         if (total_attack_strength > 0.0) {
             let current_strength_f = f32(new_strength) / 255.0; // Convert to 0-1 range
-            let damage = total_attack_strength / 3.0; // 3:1 defender advantage
+            let damage = total_attack_strength / 2.0; // DEBUG: 2:1 defender advantage instead of 3:1
             
             if (damage >= current_strength_f) {
                 // Cell is conquered - change ownership
                 new_empire_id = attacking_empire;
-                new_strength = u32((damage - current_strength_f) * 255.0); // Remaining attack strength becomes new strength
-                new_need = 64u; // Reset need for newly conquered cell
+                // DEBUG: Give conquered cell more starting strength
+                let remaining_strength = damage - current_strength_f;
+                new_strength = u32(clamp((remaining_strength + 0.3) * 255.0, 80.0, 255.0)); // Minimum 80 strength
+                new_need = 32u; // Lower initial need for newly conquered cell
             } else {
                 // Cell survives but takes damage
                 new_strength = u32((current_strength_f - damage) * 255.0);
             }
         }
         
-        // PHASE 2: Generate strength for occupied cells and plan attacks
+        // PHASE 2: Generate strength, calculate need, and make decisions for occupied cells
         if (new_empire_id != 0u) {
-            // Generate strength based on terrain factor (only for occupied cells)
-            let strength_generation = terrain_factor * 255.0 / 10.0; // DEBUG: Much faster generation for testing
-            new_strength = min(255u, new_strength + u32(strength_generation));
+            // Calculate need based on enemy pressure and friendly support
+            var calculated_need = 0.0;
+            var max_enemy_strength = 0.0;
+            var min_enemy_strength = 2.0;
+            var min_enemy_direction = 6u;
+            var max_friendly_need = 0.0;
+            var max_need_direction = 6u;
+            var friendly_neighbors = 0u;
+            var enemy_neighbors = 0u;
             
-            // Plan attack if we have enough strength
-            let current_strength_f = f32(new_strength) / 255.0;
-            
-            // Look for weakest enemy neighbor to attack
-            var min_enemy_strength = 2.0; // Higher than max possible (1.0)
-            var chosen_direction = 6u; // Invalid direction initially
-            
+            // Analyze all neighbors for need calculation
             for (var dir = 0u; dir < 6u; dir++) {
-                let target_offset = get_hex_neighbor_offset(dir, pos.y);
-                let target_pos = pos + target_offset;
-                let target_cell = get_cell(target_pos);
-                let target_empire = float_to_u8(target_cell.r);
-                let target_strength = f32(float_to_u8(target_cell.g)) / 255.0;
+                let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
+                let neighbor_pos = pos + neighbor_offset;
+                let neighbor_cell = get_cell(neighbor_pos);
+                let neighbor_empire = float_to_u8(neighbor_cell.r);
+                let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
+                let neighbor_need = f32(float_to_u8(neighbor_cell.b)) / 255.0;
                 
-                // Check if target is water
-                let target_terrain = get_terrain(target_pos);
-                let target_is_water = target_terrain.r < ocean_cutoff;
+                // Check if neighbor is water
+                let neighbor_terrain = get_terrain(neighbor_pos);
+                let neighbor_is_water = neighbor_terrain.r < ocean_cutoff;
                 
-                // Only consider targets that are different empire, on land, and weaker
-                if (target_empire != new_empire_id && !target_is_water) {
-                    if (target_strength < min_enemy_strength) {
-                        // Check if we have enough strength to make meaningful attack
-                        let required_strength = target_strength * 3.0; // Need to overcome 3:1 advantage
+                if (!neighbor_is_water) {
+                    if (neighbor_empire == new_empire_id) {
+                        // Friendly neighbor
+                        friendly_neighbors++;
+                        if (neighbor_need > max_friendly_need) {
+                            max_friendly_need = neighbor_need;
+                            max_need_direction = dir;
+                        } else if (neighbor_need == max_friendly_need) {
+                            // If needs are equal, randomly choose between them to avoid directional bias
+                            if (rng_range(global_id.x, global_id.y, frame_data, dir * 7u, 2u) == 0u) {
+                                max_need_direction = dir;
+                            }
+                        }
+                    } else {
+                        // Enemy or unclaimed neighbor
+                        enemy_neighbors++;
+                        calculated_need += neighbor_strength; // Add pressure from enemies
                         
-                        // DEBUG: Much lower threshold for testing
-                        if (current_strength_f > required_strength * 0.1) { // Much more aggressive for debugging
-                            min_enemy_strength = target_strength;
-                            chosen_direction = dir;
+                        if (neighbor_empire == 0u) {
+                            // Unclaimed territory reduces need (easier to expand)
+                            calculated_need -= 0.9 * neighbor_strength;
+                        }
+                        
+                        // Track enemy strength for attack decisions
+                        if (neighbor_strength > max_enemy_strength) {
+                            max_enemy_strength = neighbor_strength;
+                        }
+                        if (neighbor_strength < min_enemy_strength && neighbor_empire != new_empire_id) {
+                            min_enemy_strength = neighbor_strength;
+                            min_enemy_direction = dir;
+                        } else if (neighbor_strength == min_enemy_strength && neighbor_empire != new_empire_id) {
+                            // If strengths are equal, randomly choose between them to avoid directional bias
+                            if (rng_range(global_id.x, global_id.y, frame_data, dir * 10u, 2u) == 0u) {
+                                min_enemy_direction = dir;
+                            }
                         }
                     }
                 }
             }
             
-            // Set attack action if we found a valid target
-            if (chosen_direction < 6u) {
-                new_action = chosen_direction | (31u << 3u); // direction + strength allocation bits
-            } else {
-                new_action = 0u; // No valid targets
+            // Normalize need by number of enemy neighbors
+            if (enemy_neighbors > 0u) {
+                calculated_need /= f32(enemy_neighbors);
             }
+            
+            // Apply terrain-based need factor (empiresbevy style)
+            let need_factor = ((-altitude) / (1.0 - ocean_cutoff)) + (1.0 / (1.0 - ocean_cutoff));
+            calculated_need *= need_factor;
+            
+            // Update need value
+            new_need = u32(clamp(calculated_need * 255.0, 0.0, 255.0));
+            
+            // Apply terrain penalties to strength (empiresbevy style) - DEBUG: Much gentler
+            let current_strength_f = f32(new_strength) / 255.0;
+            let terrain_penalty = 0.8 + (f32(friendly_neighbors) * 0.05); // DEBUG: Much gentler penalty (80%-110%)
+            let penalized_strength = current_strength_f * terrain_penalty;
+            
+            // Generate strength based on terrain factor (only for occupied cells)
+            let strength_generation = terrain_factor / 25.0; // DEBUG: Faster generation rate
+            let final_strength = penalized_strength + strength_generation;
+            new_strength = u32(clamp(final_strength * 255.0, 0.0, 255.0));
+            
+            // Decision making: Favor expansion over reinforcement for debugging
+            let defensive_reserve = max_enemy_strength / 6.0; // DEBUG: Much smaller reserves
+            let extra_strength = current_strength_f - defensive_reserve;
+            
+            if (extra_strength > 0.05) { // DEBUG: Much lower threshold
+                // DEBUG: Very aggressive attack threshold to encourage expansion
+                let attack_threshold = min_enemy_strength * 0.5; // DEBUG: Much easier to attack
+                
+                if (extra_strength > attack_threshold && min_enemy_direction < 6u) {
+                    // Attack weakest enemy - prioritize expansion
+                    new_action = min_enemy_direction | (31u << 3u);
+                } else if (max_friendly_need > calculated_need * 2.0 && max_need_direction < 6u) {
+                    // Only reinforce if friend has MUCH higher need - favor expansion
+                    new_action = max_need_direction | (15u << 3u); // Half strength for reinforcement
+                } else if (min_enemy_direction < 6u) {
+                    // If we can't meet attack threshold, try anyway (very aggressive debug mode)
+                    new_action = min_enemy_direction | (15u << 3u); // Weaker attack
+                } else {
+                    new_action = 0u; // No action
+                }
+            } else {
+                new_action = 0u; // Not enough extra strength
+            }
+            
+            // DEBUG: Disable empire extinction for now to debug other issues
+            // Empire extinction: isolated cells have chance to die
+            // if (friendly_neighbors == 0u && rng_range(global_id.x, global_id.y, frame_data, 100u, 20u) == 0u) {
+            //     new_empire_id = 0u;
+            //     new_strength = u32(altitude * 50.0); // Revert to terrain strength
+            //     new_need = 0u;
+            //     new_action = 0u;
+            // }
         }
     }
     

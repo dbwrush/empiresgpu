@@ -556,7 +556,7 @@ impl EmpireSimulation {
         // Create empire cell data (Channel layout: R=Empire ID, G=Strength, B=Need, A=Action)
         let cell_data: [u8; 4] = [
             empire_id,  // R: Empire ID
-            128,        // G: Strength (default strength for player-claimed cells)
+            200,        // G: Strength (higher initial strength to survive terrain penalties)
             64,         // B: Need (default need)
             0,          // A: Action (no initial action, will be set by compute shader)
         ];

@@ -48,27 +48,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let cell_data = textureSample(t_texture, s_texture, adjusted_tex_coords);
     let empire_id = cell_data.r;
+    let strength = cell_data.g;     // Strength value (0.0 to 1.0)
+    let need = cell_data.b;         // Need value (0.0 to 1.0)
     
-    // Visualize different empires with different colors and transparency
+    // Visualize different empires with strength-based transparency
     if (empire_id == 0.0) {
         // Unclaimed territory - completely transparent to show terrain underneath
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
-        // Claimed territory - translucent colors to show terrain underneath
-        let alpha = 0.7; // Semi-transparent
+        // Use strength to determine transparency: stronger = more opaque
+        // Minimum alpha of 0.5, maximum of 0.9, scaling with strength
+        let strength_alpha = 0.5 + (strength * 0.4);
+        
+        // Use need to slightly tint the color (higher need = more intense)
+        let need_intensity = 0.7 + (need * 0.3);
         
         if (empire_id < 0.004) { // Empire 1 (1/255 ≈ 0.004)
-            // Empire 1 - bright red
-            return vec4<f32>(1.0, 0.2, 0.2, alpha);
+            // Empire 1 - bright red, intensity based on need
+            return vec4<f32>(1.0 * need_intensity, 0.2, 0.2, strength_alpha);
         } else if (empire_id < 0.008) { // Empire 2 (2/255 ≈ 0.008)
             // Empire 2 - bright blue
-            return vec4<f32>(0.2, 0.2, 1.0, alpha);
+            return vec4<f32>(0.2, 0.2, 1.0 * need_intensity, strength_alpha);
         } else if (empire_id < 0.012) { // Empire 3 (3/255 ≈ 0.012)
             // Empire 3 - bright green
-            return vec4<f32>(0.2, 1.0, 0.2, alpha);
+            return vec4<f32>(0.2, 1.0 * need_intensity, 0.2, strength_alpha);
         } else {
             // Other empires - yellow
-            return vec4<f32>(1.0, 1.0, 0.2, alpha);
+            return vec4<f32>(1.0 * need_intensity, 1.0 * need_intensity, 0.2, strength_alpha);
         }
     }
 }
