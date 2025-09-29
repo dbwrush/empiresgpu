@@ -246,19 +246,26 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         var current_strength_f = f32(new_strength) / 255.0;
         current_strength_f += total_reinforcement_strength;
         
-        // Combat resolution with stronger defensive advantage
+        // New attrition-based combat resolution
         if (total_attack_strength > 0.0) {
-            let damage = total_attack_strength / 3.0; // 3:1 defender advantage - harder to conquer
+            // Calculate casualties: attackers inflict damage at 3:1 ratio (defender advantage)
+            let casualties = total_attack_strength / 3.0;
+            current_strength_f -= casualties;
             
-            if (damage >= current_strength_f) {
-                // Cell is conquered - but only if attack was significantly stronger
+            // Check if this results in conquest
+            let required_strength_for_conquest = current_strength_f * 3.0;
+            
+            if (total_attack_strength >= required_strength_for_conquest && current_strength_f <= 0.0) {
+                // Full conquest: attacker wins and occupies with remaining strength
                 new_empire_id = attacking_empire;
-                new_strength = u32(clamp((damage - current_strength_f + 0.1) * 255.0, 30.0, 255.0));
-                new_need = 64u; // Reset need for conquered cell
+                let remaining_attack_strength = total_attack_strength - (f32(strength) / 255.0 * 3.0);
+                new_strength = u32(clamp(remaining_attack_strength * 255.0, 20.0, 255.0)); // Minimum 20 strength
+                new_need = 64u; // Reset need for newly conquered cell
             } else {
-                // Cell survives - reduce damage taken
-                current_strength_f -= damage;
-                new_strength = u32(clamp(current_strength_f * 255.0, 0.0, 255.0));
+                // Attrition only: defender survives but is weakened
+                current_strength_f = max(current_strength_f, 0.01); // Minimum survival strength
+                new_strength = u32(clamp(current_strength_f * 255.0, 1.0, 255.0));
+                // Empire ID and need remain unchanged
             }
         } else {
             // No combat, just apply reinforcements
@@ -375,69 +382,57 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let final_strength = penalized_strength + strength_generation;
             current_strength_f = final_strength;
             
-            // Smart tactical decision making with proper threat assessment
-            // Calculate total defensive requirements against ALL potential threats
-            var total_defensive_requirement = 0.0;
+            // Smart tactical decision making - defend against strongest single enemy only
+            // Only the strongest enemy can realistically attack us in one turn
             
-            // Sum up all neighboring enemy threats (need 3:1 advantage to defend successfully)
-            for (var dir = 0u; dir < 6u; dir++) {
-                let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
-                let neighbor_pos = pos + neighbor_offset;
-                let neighbor_cell = get_cell(neighbor_pos);
-                let neighbor_empire = float_to_u8(neighbor_cell.r);
-                let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
-                
-                // Check if neighbor is water
-                let neighbor_terrain = get_terrain(neighbor_pos);
-                let neighbor_is_water = neighbor_terrain.r < ocean_cutoff;
-                
-                if (!neighbor_is_water && neighbor_empire != 0u && neighbor_empire != new_empire_id) {
-                    // Enemy cell - need to be able to defend against potential attacks
-                    // Account for the 3:1 advantage attackers need, so we need 1/3 strength to defend
-                    total_defensive_requirement += neighbor_strength / 3.0;
-                }
-            }
+            // Find the strongest enemy neighbor (already calculated above as max_enemy_strength)
+            // We need 1/3 of their strength to successfully defend (due to 3:1 attacker advantage requirement)
+            let required_defense = max_enemy_strength / 3.0;
             
-            // Add terrain-based defensive buffer (mountains require more reserves)
-            let base_buffer = 0.05; // 5% base safety buffer
-            let terrain_buffer_multiplier = 1.0 + (terrain_penalty * terrain_penalty * 2.0);
-            let defensive_buffer = total_defensive_requirement * (base_buffer * terrain_buffer_multiplier);
-            let total_required_defense = total_defensive_requirement + defensive_buffer;
+            // Add small terrain-based defensive buffer for mountains
+            let base_buffer = 0.02; // 2% base safety buffer  
+            let terrain_buffer_multiplier = 1.0 + (terrain_penalty * terrain_penalty * 1.0);
+            let defensive_buffer = required_defense * (base_buffer * terrain_buffer_multiplier);
+            let total_required_defense = required_defense + defensive_buffer;
             
             // Available strength for offensive operations after ensuring defense
             let available_for_action = current_strength_f - total_required_defense;
             
-            if (available_for_action > 0.05) { // Need meaningful strength to act
+            if (available_for_action > 0.01) { // Need some strength to act (lowered threshold)
                 // Get aggression parameter for this empire
                 let empire_params = get_empire_params(new_empire_id);
-                let aggression = empire_params.g; // Green channel contains aggression
+                let aggression = empire_params.g; // Green channel contains aggression (0.0 to 1.0)
                 
-                // Calculate attack threshold based on aggression AND terrain difficulty
-                let base_multiplier = 3.0;  // Conservative 3:1 advantage requirement
-                let aggressive_multiplier = 0.5;  // Even aggressive empires need 0.5:1 minimum
-                let aggression_threshold = mix(base_multiplier, aggressive_multiplier, aggression);
+                // Calculate attack ratio tolerance based on aggression
+                // aggression = 0.0: only attack with 3:1 advantage (guaranteed victory)
+                // aggression = 1.0: attack with any available strength (1:1 or worse ratios)
+                let conservative_multiplier = 3.0;  // Need 3:1 advantage for guaranteed victory
+                let aggressive_multiplier = 0.1;    // Willing to attack with terrible odds
+                let attack_ratio_requirement = mix(conservative_multiplier, aggressive_multiplier, aggression);
                 
-                // Terrain penalty makes attacks much harder in mountains
-                let terrain_attack_penalty = 1.0 + (terrain_penalty * terrain_penalty * 7.0);
-                let final_attack_threshold = aggression_threshold * terrain_attack_penalty;
+                // Terrain penalty still makes attacks harder in mountains
+                let terrain_attack_penalty = 1.0 + (terrain_penalty * terrain_penalty * 4.0); // Reduced from 7.0
+                let final_attack_ratio = attack_ratio_requirement * terrain_attack_penalty;
                 
-                // Check if we can safely attack the weakest enemy without compromising defense
+                // Check if we want to attack the weakest enemy based on aggression tolerance
                 if (min_enemy_direction < 6u) {
-                    let required_attack_strength = min_enemy_strength * final_attack_threshold;
-                    let strength_after_attack = current_strength_f - required_attack_strength;
+                    let ideal_attack_strength = min_enemy_strength * final_attack_ratio;
                     
-                    // Verify we can still defend after the attack
-                    if (available_for_action >= required_attack_strength && strength_after_attack >= total_required_defense) {
-                        // Safe to attack! Calculate attack strength as 4-bit value (0-15)
-                        let scaled_attack_strength = u32(clamp(required_attack_strength * 15.0, 1.0, 15.0));
+                    // Determine actual attack strength based on what we have available
+                    let actual_attack_strength = min(available_for_action, ideal_attack_strength);
+                    
+                    // Attack if we have at least some meaningful strength to commit
+                    if (actual_attack_strength > 0.02) { // Very low threshold for aggressive empires
+                        // Encode actual attack strength as 4-bit value (0-15)  
+                        let scaled_attack_strength = u32(clamp(actual_attack_strength * 15.0, 1.0, 15.0));
                         new_action = min_enemy_direction | (1u << 7u) | (scaled_attack_strength << 3u);
                     } else {
-                        // Can't safely attack, check for reinforcement opportunities
-                        new_action = 6u; // Invalid direction = no action
+                        // Not enough strength to mount any attack
+                        new_action = 6u; // No action
                     }
                 } else {
                     // No enemies to attack, consider reinforcement
-                    new_action = 6u; // Invalid direction = no action initially
+                    new_action = 6u; // No action initially
                 }
                 
                 // If no safe attack was possible, consider reinforcement 
