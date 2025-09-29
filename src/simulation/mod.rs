@@ -2,6 +2,14 @@ use wgpu::util::DeviceExt;
 use crate::graphics::{GraphicsContext, load_shader};
 use noise::{NoiseFn, Simplex};
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RenderMode {
+    Empires = 0,
+    Strength = 1,
+    Need = 2,
+    Action = 3,
+}
+
 // Generate terrain data using simplex noise with cylindrical world wrapping
 fn generate_terrain_data(size: u32) -> Vec<u8> {
     println!("Generating terrain data with cylindrical world wrapping...");
@@ -80,8 +88,12 @@ pub struct EmpireSimulation {
     pub display_bind_group_b: wgpu::BindGroup,
     pub terrain_bind_group: wgpu::BindGroup,     // For terrain rendering
     pub compute_pipeline: wgpu::ComputePipeline,
-    pub render_pipeline: wgpu::RenderPipeline,
+    pub render_pipeline_empires: wgpu::RenderPipeline,
+    pub render_pipeline_strength: wgpu::RenderPipeline,
+    pub render_pipeline_need: wgpu::RenderPipeline,
+    pub render_pipeline_action: wgpu::RenderPipeline,
     pub terrain_pipeline: wgpu::RenderPipeline,  // For terrain rendering
+    pub current_render_mode: RenderMode,
     pub current_is_a: bool,
     pub frame_count: u32,
     pub simulation_speed: u32,
@@ -394,51 +406,60 @@ impl EmpireSimulation {
             ],
         });
         
-        // Load render shader
-        let render_shader = load_shader(&graphics.device, "shaders/empire_render.wgsl");
-        
-        // Create render pipeline
-        let render_pipeline = graphics.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Empire Simulation Render Pipeline"),
-            layout: Some(&graphics.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Empire Simulation Pipeline Layout"),
-                bind_group_layouts: &[&display_bind_group_layout, camera_bind_group_layout],
-                push_constant_ranges: &[],
-            })),
-            vertex: wgpu::VertexState {
-                module: &render_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[crate::graphics::Vertex::desc()],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &render_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: graphics.config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
+        // Create shared pipeline layout for all render modes
+        let render_pipeline_layout = graphics.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Empire Simulation Pipeline Layout"),
+            bind_group_layouts: &[&display_bind_group_layout, camera_bind_group_layout],
+            push_constant_ranges: &[],
         });
+        
+        // Helper function to create render pipeline with different shaders
+        let create_render_pipeline = |shader_path: &str, label: &str| {
+            let shader = load_shader(&graphics.device, shader_path);
+            graphics.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[crate::graphics::Vertex::desc()],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: graphics.config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            })
+        };
+        
+        // Create render pipelines for different visualization modes
+        let render_pipeline_empires = create_render_pipeline("shaders/empire_render.wgsl", "Empire Render Pipeline");
+        let render_pipeline_strength = create_render_pipeline("shaders/empire_render_strength.wgsl", "Strength Render Pipeline");
+        let render_pipeline_need = create_render_pipeline("shaders/empire_render_need.wgsl", "Need Render Pipeline");
+        let render_pipeline_action = create_render_pipeline("shaders/empire_render_action.wgsl", "Action Render Pipeline");
         
         // Create terrain bind group for rendering
         let terrain_bind_group = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -514,8 +535,12 @@ impl EmpireSimulation {
             display_bind_group_b,
             terrain_bind_group,
             compute_pipeline,
-            render_pipeline,
+            render_pipeline_empires,
+            render_pipeline_strength,
+            render_pipeline_need,
+            render_pipeline_action,
             terrain_pipeline,
+            current_render_mode: RenderMode::Empires,
             current_is_a: true,
             frame_count: 0,
             simulation_speed: 1, // Update every frame for immediate feedback
@@ -630,6 +655,23 @@ impl EmpireSimulation {
         println!("Simulation {}", if self.is_paused { "paused" } else { "resumed" });
     }
     
+    pub fn set_render_mode(&mut self, mode: RenderMode) {
+        if self.current_render_mode != mode {
+            self.current_render_mode = mode;
+            let mode_name = match mode {
+                RenderMode::Empires => "Empires (unique colors)",
+                RenderMode::Strength => "Strength Heatmap (blue=weak, red=strong)",
+                RenderMode::Need => "Need Heatmap (green=low, yellow=med, red=high)",
+                RenderMode::Action => "Action Visualization (blue=reinforce, red=attack)",
+            };
+            println!("🎨 Switched to render mode: {}", mode_name);
+        }
+    }
+    
+    pub fn get_render_mode(&self) -> RenderMode {
+        self.current_render_mode
+    }
+    
 
     
     pub fn render(&self, render_pass: &mut wgpu::RenderPass, vertex_buffer: &wgpu::Buffer, camera_bind_group: &wgpu::BindGroup) {
@@ -640,8 +682,14 @@ impl EmpireSimulation {
         render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         render_pass.draw(0..6, 0..1);
         
-        // Then, render the empire simulation (translucent on top)
-        render_pass.set_pipeline(&self.render_pipeline);
+        // Then, render the empire simulation (translucent on top) with current render mode
+        let current_pipeline = match self.current_render_mode {
+            RenderMode::Empires => &self.render_pipeline_empires,
+            RenderMode::Strength => &self.render_pipeline_strength,
+            RenderMode::Need => &self.render_pipeline_need,
+            RenderMode::Action => &self.render_pipeline_action,
+        };
+        render_pass.set_pipeline(current_pipeline);
         
         // Use the current texture for display
         let display_bind_group = if self.current_is_a {

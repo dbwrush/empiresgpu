@@ -17,7 +17,7 @@ mod ui;
 
 use graphics::GraphicsContext;
 use camera::Camera;
-use simulation::EmpireSimulation;
+use simulation::{EmpireSimulation, RenderMode};
 use ui::FpsTracker;
 
 // Centralized simulation size configuration
@@ -197,6 +197,26 @@ impl ApplicationHandler for App {
                                         state.camera.keys_pressed.insert(key_code);
                                     }
                                 },
+                                KeyCode::Digit1 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::Empires);
+                                    }
+                                },
+                                KeyCode::Digit2 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::Strength);
+                                    }
+                                },
+                                KeyCode::Digit3 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::Need);
+                                    }
+                                },
+                                KeyCode::Digit4 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::Action);
+                                    }
+                                },
                                 _ => {}
                             }
                         },
@@ -267,6 +287,10 @@ fn main() {
     println!("  WASD - Move camera around");
     println!("  Q/E - Zoom out/in");
     println!("  F3 - Toggle FPS overlay");
+    println!("  1 - Empires render mode (default)");
+    println!("  2 - Strength heatmap mode");
+    println!("  3 - Need heatmap mode");
+    println!("  4 - Action visualization mode");
     println!("  Left Click - Claim territory for Empire 1 (unique color)");
     println!("  Right Click - Unclaim territory");
     println!("  ESC - Exit");

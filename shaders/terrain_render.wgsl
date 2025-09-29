@@ -47,7 +47,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var adjusted_tex_coords = in.tex_coords;
     if ((row % 2) == 0) {
         // Offset even rows by half a pixel width
-        adjusted_tex_coords.x += 0.5 / f32(texture_dims.x);
+        adjusted_tex_coords.x -= 0.5 / f32(texture_dims.x);
     }
     
     let terrain_data = textureSample(terrain_texture, terrain_sampler, adjusted_tex_coords);

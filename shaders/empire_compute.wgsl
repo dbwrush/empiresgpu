@@ -169,62 +169,77 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             new_strength = u32(altitude * 50.0); // DEBUG: Much weaker initial strength
         }
         
-        // PHASE 1: Resolve incoming attacks and update strength/ownership
-        // Calculate total incoming attack strength from all directions
+        // PHASE 1: Handle incoming attacks and reinforcements
         var total_attack_strength = 0.0;
+        var total_reinforcement_strength = 0.0;
         var attacking_empire = 0u;
         var found_attacker = false;
         
-        // Check all 6 hex directions for incoming attacks
+        // Check all 6 hex directions for incoming actions
         for (var dir = 0u; dir < 6u; dir++) {
             let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
             let neighbor_pos = pos + neighbor_offset;
             let neighbor_cell = get_cell(neighbor_pos);
             let neighbor_empire = float_to_u8(neighbor_cell.r);
-            let neighbor_strength = float_to_u8(neighbor_cell.g);
+            let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
             let neighbor_action = float_to_u8(neighbor_cell.a);
             
-            // If neighbor has an empire and is attacking (action != 0)
+            // If neighbor has an action targeting this cell
             if (neighbor_empire != 0u && neighbor_action != 0u) {
                 let neighbor_direction = neighbor_action & 7u; // Extract direction (0-5)
+                let action_type = (neighbor_action >> 7u) & 3u; // Extract action type (bits 7-8)
                 
-                // Calculate where the neighbor is attacking
+                // Calculate where the neighbor is acting
                 let neighbor_target_offset = get_hex_neighbor_offset(neighbor_direction, neighbor_pos.y);
                 let neighbor_target = neighbor_pos + neighbor_target_offset;
                 
-                // If the neighbor is attacking this cell
+                // If the neighbor is acting on this cell
                 if (neighbor_target.x == pos.x && neighbor_target.y == pos.y) {
-                    // Only count attacks from different empires
-                    if (neighbor_empire != empire_id) {
-                        let attack_strength = f32(neighbor_strength) / 255.0; // Convert to 0-1 range
-                        total_attack_strength += attack_strength;
-                        
-                        // Remember one of the attacking empires (last one wins if multiple)
-                        if (!found_attacker) {
-                            attacking_empire = neighbor_empire;
-                            found_attacker = true;
+                    if (action_type == 1u) {
+                        // Attack action - calculate actual attack strength
+                        if (neighbor_empire != empire_id) {
+                            // For attacks, we need to estimate how much strength they're committing
+                            // Since attackers only attack when they have extra strength, use a more realistic amount
+                            let estimated_attack_strength = neighbor_strength * 0.6; // More conservative estimate
+                            total_attack_strength += estimated_attack_strength;
+                            
+                            // Remember attacking empire (last one wins if multiple)
+                            if (!found_attacker) {
+                                attacking_empire = neighbor_empire;
+                                found_attacker = true;
+                            }
                         }
+                    } else if (action_type == 2u && neighbor_empire == empire_id) {
+                        // Reinforcement action from same empire
+                        let transfer_amount_bits = (neighbor_action >> 3u) & 15u; // Extract amount (bits 3-6)
+                        let transfer_amount = f32(transfer_amount_bits) / 15.0; // Convert back to 0-1 range
+                        total_reinforcement_strength += transfer_amount;
                     }
                 }
             }
         }
         
-        // Apply combat resolution - DEBUG: More favorable to attackers
+        // Apply reinforcements and combat resolution
+        var current_strength_f = f32(new_strength) / 255.0;
+        current_strength_f += total_reinforcement_strength;
+        
+        // Combat resolution with stronger defensive advantage
         if (total_attack_strength > 0.0) {
-            let current_strength_f = f32(new_strength) / 255.0; // Convert to 0-1 range
-            let damage = total_attack_strength / 2.0; // DEBUG: 2:1 defender advantage instead of 3:1
+            let damage = total_attack_strength / 3.0; // 3:1 defender advantage - harder to conquer
             
             if (damage >= current_strength_f) {
-                // Cell is conquered - change ownership
+                // Cell is conquered - but only if attack was significantly stronger
                 new_empire_id = attacking_empire;
-                // DEBUG: Give conquered cell more starting strength
-                let remaining_strength = damage - current_strength_f;
-                new_strength = u32(clamp((remaining_strength + 0.3) * 255.0, 80.0, 255.0)); // Minimum 80 strength
-                new_need = 32u; // Lower initial need for newly conquered cell
+                new_strength = u32(clamp((damage - current_strength_f + 0.1) * 255.0, 30.0, 255.0));
+                new_need = 64u; // Reset need for conquered cell
             } else {
-                // Cell survives but takes damage
-                new_strength = u32((current_strength_f - damage) * 255.0);
+                // Cell survives - reduce damage taken
+                current_strength_f -= damage;
+                new_strength = u32(clamp(current_strength_f * 255.0, 0.0, 255.0));
             }
+        } else {
+            // No combat, just apply reinforcements
+            new_strength = u32(clamp(current_strength_f * 255.0, 0.0, 255.0));
         }
         
         // PHASE 2: Generate strength, calculate need, and make decisions for occupied cells
@@ -301,42 +316,62 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let need_factor = ((-altitude) / (1.0 - ocean_cutoff)) + (1.0 / (1.0 - ocean_cutoff));
             calculated_need *= need_factor;
             
+            // CRITICAL: Add neighbor need propagation with very gradual decay
+            // Use multiplicative approach with high multiplier for gradual propagation
+            let propagated_need = max_friendly_need * 0.9999; // Very gradual decay over distance
+            calculated_need = calculated_need + propagated_need;
+            
             // Update need value
             new_need = u32(clamp(calculated_need * 255.0, 0.0, 255.0));
             
-            // Apply terrain penalties to strength (empiresbevy style) - DEBUG: Much gentler
-            let current_strength_f = f32(new_strength) / 255.0;
-            let terrain_penalty = 0.8 + (f32(friendly_neighbors) * 0.05); // DEBUG: Much gentler penalty (80%-110%)
+            // Apply terrain penalties and generate strength
+            var current_strength_f = f32(new_strength) / 255.0;
+            let terrain_penalty = 0.9 + (f32(friendly_neighbors) * 0.02); // Very gentle penalty (90%-102%)
             let penalized_strength = current_strength_f * terrain_penalty;
             
             // Generate strength based on terrain factor (only for occupied cells)
-            let strength_generation = terrain_factor / 25.0; // DEBUG: Faster generation rate
+            let strength_generation = terrain_factor / 20.0; // Faster generation rate
             let final_strength = penalized_strength + strength_generation;
-            new_strength = u32(clamp(final_strength * 255.0, 0.0, 255.0));
+            current_strength_f = final_strength;
             
-            // Decision making: Favor expansion over reinforcement for debugging
-            let defensive_reserve = max_enemy_strength / 6.0; // DEBUG: Much smaller reserves
+            // Simple decision making focused on expansion and reinforcement
+            let defensive_reserve = max_enemy_strength * 0.15; // Keep 15% for defense  
             let extra_strength = current_strength_f - defensive_reserve;
             
-            if (extra_strength > 0.05) { // DEBUG: Much lower threshold
-                // DEBUG: Very aggressive attack threshold to encourage expansion
-                let attack_threshold = min_enemy_strength * 0.5; // DEBUG: Much easier to attack
-                
-                if (extra_strength > attack_threshold && min_enemy_direction < 6u) {
-                    // Attack weakest enemy - prioritize expansion
-                    new_action = min_enemy_direction | (31u << 3u);
-                } else if (max_friendly_need > calculated_need * 2.0 && max_need_direction < 6u) {
-                    // Only reinforce if friend has MUCH higher need - favor expansion
-                    new_action = max_need_direction | (15u << 3u); // Half strength for reinforcement
-                } else if (min_enemy_direction < 6u) {
-                    // If we can't meet attack threshold, try anyway (very aggressive debug mode)
-                    new_action = min_enemy_direction | (15u << 3u); // Weaker attack
+            if (extra_strength > 0.05) { // Lower threshold - need at least 0.05 strength to act
+                // Prioritize attacking weak enemies for expansion
+                if (min_enemy_direction < 6u && extra_strength > min_enemy_strength * 0.6) {
+                    // Attack! Store direction and use strength in combat resolution
+                    new_action = min_enemy_direction | (1u << 7u); // Set attack flag
+                } else if (max_need_direction < 6u && max_friendly_need > (f32(need) / 255.0)) {
+                    // Smart reinforcement: send proportional to need difference and keep reserves
+                    let my_need = f32(need) / 255.0;
+                    let need_ratio = max_friendly_need / max(my_need, 0.01); // Avoid division by zero
+                    
+                    // Calculate transfer based on need ratio and our current need level
+                    // High need cells keep more, low need cells send more
+                    let base_transfer_rate = 0.3; // Base transfer rate
+                    let need_factor = 1.0 - (my_need * 0.7); // Lower need = higher transfer
+                    let ratio_factor = min(need_ratio - 1.0, 2.0) * 0.2; // Up to 40% more for high need difference
+                    
+                    let transfer_rate = base_transfer_rate * need_factor + ratio_factor;
+                    let transfer_amount = extra_strength * clamp(transfer_rate, 0.1, 0.6); // 10%-60% transfer
+                    
+                    // Encode transfer amount in action (scale to 0-15 range for 4 bits)
+                    let scaled_transfer = u32(clamp(transfer_amount * 15.0, 1.0, 15.0));
+                    new_action = max_need_direction | (2u << 7u) | (scaled_transfer << 3u); // direction + type + amount
+                    
+                    // Remove the transferred strength from this cell
+                    current_strength_f -= transfer_amount;
                 } else {
-                    new_action = 0u; // No action
+                    new_action = 0u; // No good action available
                 }
             } else {
                 new_action = 0u; // Not enough extra strength
             }
+            
+            // Update final strength
+            new_strength = u32(clamp(current_strength_f * 255.0, 0.0, 255.0));
             
             // DEBUG: Disable empire extinction for now to debug other issues
             // Empire extinction: isolated cells have chance to die
