@@ -10,6 +10,9 @@ var<uniform> frame_data: u32;
 @group(0) @binding(3)
 var terrain_texture: texture_2d<f32>;
 
+@group(0) @binding(4)
+var empire_params_texture: texture_2d<f32>;
+
 // High-quality pseudorandom number generator using PCG algorithm
 // Returns a pseudorandom u32 based on position and frame
 fn pcg_hash(x: u32, y: u32, frame: u32) -> u32 {
@@ -48,7 +51,7 @@ fn get_cell(pos: vec2<i32>) -> vec4<f32> {
 }
 
 // Get terrain data at position with wrapping
-// Returns vec4<f32> with (altitude, unused, unused, alpha) normalized to [0,1]
+// Returns vec4<f32> with (altitude, unused, unused, terrain_penalty) normalized to [0,1]
 fn get_terrain(pos: vec2<i32>) -> vec4<f32> {
     let dims = textureDimensions(terrain_texture);
     let wrapped_pos = vec2<i32>(
@@ -56,7 +59,22 @@ fn get_terrain(pos: vec2<i32>) -> vec4<f32> {
         (pos.y + i32(dims.y)) % i32(dims.y)
     );
     let terrain_data = textureLoad(terrain_texture, wrapped_pos, 0);
-    return terrain_data; // altitude, terrain_type, unused, ocean_cutoff
+    return terrain_data; // altitude, unused, unused, terrain_penalty
+}
+
+// Get empire parameters for a specific empire
+// Returns: R=diplomacy, G=aggression, B=reserved, A=reserved
+fn get_empire_params(empire_id: u32) -> vec4<f32> {
+    if (empire_id == 0u || empire_id > 255u) {
+        // Invalid empire ID, return neutral values
+        return vec4<f32>(0.5, 0.5, 0.0, 1.0);
+    }
+    
+    // Empire parameters texture is organized as a 256x256 grid
+    // Row = empire asking, Column = target empire (for diplomacy)
+    // For aggression, we use the empire's own row (doesn't matter which column)
+    let empire_pos = vec2<i32>(0, i32(empire_id - 1u)); // Use first column for aggression
+    return textureLoad(empire_params_texture, empire_pos, 0);
 }
 
 // Convert float [0,1] to u8 [0,255]
@@ -137,6 +155,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Read terrain data (for AI decisions and water detection)
     let terrain = get_terrain(pos);
     let altitude = terrain.r;      // 0.0 to 1.0 (elevation)
+    let terrain_penalty = terrain.a; // 0.0 to 1.0 (movement/logistics penalty)
     
     // Fixed ocean cutoff (matching empiresbevy's approach)
     let ocean_cutoff = 0.53;
@@ -184,10 +203,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
             let neighbor_action = float_to_u8(neighbor_cell.a);
             
-            // If neighbor has an action targeting this cell
+            // If neighbor has a valid action targeting this cell
             if (neighbor_empire != 0u && neighbor_action != 0u) {
                 let neighbor_direction = neighbor_action & 7u; // Extract direction (0-5)
                 let action_type = (neighbor_action >> 7u) & 3u; // Extract action type (bits 7-8)
+                
+                // Skip invalid directions (6 = no action, 7 = invalid)
+                if (neighbor_direction >= 6u) {
+                    continue;
+                }
                 
                 // Calculate where the neighbor is acting
                 let neighbor_target_offset = get_hex_neighbor_offset(neighbor_direction, neighbor_pos.y);
@@ -196,12 +220,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 // If the neighbor is acting on this cell
                 if (neighbor_target.x == pos.x && neighbor_target.y == pos.y) {
                     if (action_type == 1u) {
-                        // Attack action - calculate actual attack strength
+                        // Attack action - use encoded attack strength
                         if (neighbor_empire != empire_id) {
-                            // For attacks, we need to estimate how much strength they're committing
-                            // Since attackers only attack when they have extra strength, use a more realistic amount
-                            let estimated_attack_strength = neighbor_strength * 0.6; // More conservative estimate
-                            total_attack_strength += estimated_attack_strength;
+                            let attack_strength_bits = (neighbor_action >> 3u) & 15u; // Extract attack strength (bits 3-6)
+                            let attack_strength = f32(attack_strength_bits) / 15.0; // Convert back to 0-1 range
+                            total_attack_strength += attack_strength;
                             
                             // Remember attacking empire (last one wins if multiple)
                             if (!found_attacker) {
@@ -316,58 +339,142 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let need_factor = ((-altitude) / (1.0 - ocean_cutoff)) + (1.0 / (1.0 - ocean_cutoff));
             calculated_need *= need_factor;
             
-            // CRITICAL: Add neighbor need propagation with very gradual decay
-            // Use multiplicative approach with high multiplier for gradual propagation
-            let propagated_need = max_friendly_need * 0.9999; // Very gradual decay over distance
+            // CRITICAL: Terrain-aware need propagation to discourage mountain border gore
+            // High terrain penalty (mountains) severely reduces need propagation efficiency
+            // This encourages empires to prefer coastal/lowland reinforcement routes
+            let base_propagation_efficiency = 0.95; // High base efficiency in good terrain
+            
+            // Exponential decay based on terrain penalty - mountains block need signals effectively
+            // Ocean/plains (penalty=0.05-0.15): 90-85% propagation efficiency  
+            // Hills (penalty=0.45): 65% propagation efficiency
+            // Mountains (penalty=0.95): 15% propagation efficiency (severe blocking)
+            let propagation_efficiency = base_propagation_efficiency * (1.0 - terrain_penalty * 0.85);
+            
+            let propagated_need = max_friendly_need * propagation_efficiency;
             calculated_need = calculated_need + propagated_need;
             
             // Update need value
             new_need = u32(clamp(calculated_need * 255.0, 0.0, 255.0));
             
-            // Apply terrain penalties and generate strength
+            // Apply severe terrain penalties to discourage mountain occupation
             var current_strength_f = f32(new_strength) / 255.0;
-            let terrain_penalty = 0.9 + (f32(friendly_neighbors) * 0.02); // Very gentle penalty (90%-102%)
-            let penalized_strength = current_strength_f * terrain_penalty;
             
-            // Generate strength based on terrain factor (only for occupied cells)
-            let strength_generation = terrain_factor / 20.0; // Faster generation rate
+            // Harsh logistics penalty in difficult terrain - mountains are expensive to hold
+            // Ocean/plains (penalty=0.05-0.15): 95-85% strength retention
+            // Hills (penalty=0.45): 55% strength retention  
+            // Mountains (penalty=0.95): 5% strength retention (unsustainable)
+            let logistics_penalty = 1.0 - (terrain_penalty * 0.95);
+            let penalized_strength = current_strength_f * logistics_penalty;
+            
+            // Strength generation heavily biased towards low altitude (coastal preference)
+            // Mountains generate almost no strength, encouraging abandonment
+            let base_generation = terrain_factor / 20.0;
+            let terrain_generation_penalty = 1.0 - (terrain_penalty * 0.9); // 90% reduction in mountains
+            let strength_generation = base_generation * terrain_generation_penalty;
+            
             let final_strength = penalized_strength + strength_generation;
             current_strength_f = final_strength;
             
-            // Simple decision making focused on expansion and reinforcement
-            let defensive_reserve = max_enemy_strength * 0.15; // Keep 15% for defense  
-            let extra_strength = current_strength_f - defensive_reserve;
+            // Smart tactical decision making with proper threat assessment
+            // Calculate total defensive requirements against ALL potential threats
+            var total_defensive_requirement = 0.0;
             
-            if (extra_strength > 0.05) { // Lower threshold - need at least 0.05 strength to act
-                // Prioritize attacking weak enemies for expansion
-                if (min_enemy_direction < 6u && extra_strength > min_enemy_strength * 0.6) {
-                    // Attack! Store direction and use strength in combat resolution
-                    new_action = min_enemy_direction | (1u << 7u); // Set attack flag
-                } else if (max_need_direction < 6u && max_friendly_need > (f32(need) / 255.0)) {
-                    // Smart reinforcement: send proportional to need difference and keep reserves
+            // Sum up all neighboring enemy threats (need 3:1 advantage to defend successfully)
+            for (var dir = 0u; dir < 6u; dir++) {
+                let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
+                let neighbor_pos = pos + neighbor_offset;
+                let neighbor_cell = get_cell(neighbor_pos);
+                let neighbor_empire = float_to_u8(neighbor_cell.r);
+                let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
+                
+                // Check if neighbor is water
+                let neighbor_terrain = get_terrain(neighbor_pos);
+                let neighbor_is_water = neighbor_terrain.r < ocean_cutoff;
+                
+                if (!neighbor_is_water && neighbor_empire != 0u && neighbor_empire != new_empire_id) {
+                    // Enemy cell - need to be able to defend against potential attacks
+                    // Account for the 3:1 advantage attackers need, so we need 1/3 strength to defend
+                    total_defensive_requirement += neighbor_strength / 3.0;
+                }
+            }
+            
+            // Add terrain-based defensive buffer (mountains require more reserves)
+            let base_buffer = 0.05; // 5% base safety buffer
+            let terrain_buffer_multiplier = 1.0 + (terrain_penalty * terrain_penalty * 2.0);
+            let defensive_buffer = total_defensive_requirement * (base_buffer * terrain_buffer_multiplier);
+            let total_required_defense = total_defensive_requirement + defensive_buffer;
+            
+            // Available strength for offensive operations after ensuring defense
+            let available_for_action = current_strength_f - total_required_defense;
+            
+            if (available_for_action > 0.05) { // Need meaningful strength to act
+                // Get aggression parameter for this empire
+                let empire_params = get_empire_params(new_empire_id);
+                let aggression = empire_params.g; // Green channel contains aggression
+                
+                // Calculate attack threshold based on aggression AND terrain difficulty
+                let base_multiplier = 3.0;  // Conservative 3:1 advantage requirement
+                let aggressive_multiplier = 0.5;  // Even aggressive empires need 0.5:1 minimum
+                let aggression_threshold = mix(base_multiplier, aggressive_multiplier, aggression);
+                
+                // Terrain penalty makes attacks much harder in mountains
+                let terrain_attack_penalty = 1.0 + (terrain_penalty * terrain_penalty * 7.0);
+                let final_attack_threshold = aggression_threshold * terrain_attack_penalty;
+                
+                // Check if we can safely attack the weakest enemy without compromising defense
+                if (min_enemy_direction < 6u) {
+                    let required_attack_strength = min_enemy_strength * final_attack_threshold;
+                    let strength_after_attack = current_strength_f - required_attack_strength;
+                    
+                    // Verify we can still defend after the attack
+                    if (available_for_action >= required_attack_strength && strength_after_attack >= total_required_defense) {
+                        // Safe to attack! Calculate attack strength as 4-bit value (0-15)
+                        let scaled_attack_strength = u32(clamp(required_attack_strength * 15.0, 1.0, 15.0));
+                        new_action = min_enemy_direction | (1u << 7u) | (scaled_attack_strength << 3u);
+                    } else {
+                        // Can't safely attack, check for reinforcement opportunities
+                        new_action = 6u; // Invalid direction = no action
+                    }
+                } else {
+                    // No enemies to attack, consider reinforcement
+                    new_action = 6u; // Invalid direction = no action initially
+                }
+                
+                // If no safe attack was possible, consider reinforcement 
+                if (new_action == 6u && max_need_direction < 6u && max_friendly_need > (f32(need) / 255.0)) {
                     let my_need = f32(need) / 255.0;
                     let need_ratio = max_friendly_need / max(my_need, 0.01); // Avoid division by zero
                     
-                    // Calculate transfer based on need ratio and our current need level
-                    // High need cells keep more, low need cells send more
-                    let base_transfer_rate = 0.3; // Base transfer rate
-                    let need_factor = 1.0 - (my_need * 0.7); // Lower need = higher transfer
-                    let ratio_factor = min(need_ratio - 1.0, 2.0) * 0.2; // Up to 40% more for high need difference
-                    
-                    let transfer_rate = base_transfer_rate * need_factor + ratio_factor;
-                    let transfer_amount = extra_strength * clamp(transfer_rate, 0.1, 0.6); // 10%-60% transfer
-                    
-                    // Encode transfer amount in action (scale to 0-15 range for 4 bits)
-                    let scaled_transfer = u32(clamp(transfer_amount * 15.0, 1.0, 15.0));
-                    new_action = max_need_direction | (2u << 7u) | (scaled_transfer << 3u); // direction + type + amount
-                    
-                    // Remove the transferred strength from this cell
-                    current_strength_f -= transfer_amount;
-                } else {
-                    new_action = 0u; // No good action available
+                    // Only reinforce if the need difference is significant enough to justify the risk
+                    if (need_ratio > 1.2) { // At least 20% more need
+                        // Calculate safe transfer amount that won't compromise our defense
+                        let base_transfer_rate = 0.2; // Conservative transfer rate
+                        let need_factor = 1.0 - (my_need * 0.8); // Keep more if we also have high need
+                        
+                        // Terrain penalty for reinforcement efficiency
+                        let transfer_efficiency = 1.0 - (terrain_penalty * 0.95);
+                        
+                        let safe_transfer_rate = base_transfer_rate * need_factor * transfer_efficiency;
+                        let proposed_transfer = available_for_action * clamp(safe_transfer_rate, 0.05, 0.4);
+                        
+                        // Verify transfer won't compromise defense
+                        if (current_strength_f - proposed_transfer >= total_required_defense) {
+                            // Safe to reinforce
+                            let scaled_transfer = u32(clamp(proposed_transfer * 15.0, 1.0, 15.0));
+                            new_action = max_need_direction | (2u << 7u) | (scaled_transfer << 3u);
+                            current_strength_f -= proposed_transfer;
+                        } else {
+                            // Not safe to reinforce
+                            new_action = 6u; // No action
+                        }
+                    } else {
+                        // Need difference not significant enough
+                        new_action = 6u; // No action
+                    }
                 }
             } else {
-                new_action = 0u; // Not enough extra strength
+                // Not enough available strength for any action
+                new_action = 6u; // No action (invalid direction indicates no action)
             }
             
             // Update final strength

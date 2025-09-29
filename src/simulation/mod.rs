@@ -45,11 +45,36 @@ fn generate_terrain_data(size: u32) -> Vec<u8> {
             // Store elevation directly as 0-255, let shader handle ocean cutoff
             let altitude = (elevation * 255.0).clamp(0.0, 255.0) as u8;
             
-            // Store as RGBA: R=altitude, G=unused, B=unused, A=255 (full alpha)
+            // Calculate terrain penalty using smooth functions for need propagation and reinforcements
+            // Higher elevation = more difficult terrain = exponentially higher penalty
+            // Ocean (below 0.53) has very low penalty for naval movement
+            // Mountains (above 0.8) have severe penalties to discourage border gore
+            let terrain_penalty = if elevation < 0.53 {
+                // Ocean/water - excellent for naval logistics and need propagation
+                0.05
+            } else {
+                // Land elevation penalty using smooth exponential curve
+                // Normalize land elevation from 0.53-1.0 to 0.0-1.0 range
+                let land_elevation = (elevation - 0.53) / (1.0 - 0.53);
+                
+                // Exponential penalty curve: starts low for plains, becomes severe for mountains
+                // At plains (land_elevation=0.0): penalty = 0.15 (slight penalty)
+                // At mid-hills (land_elevation=0.5): penalty = 0.45 (moderate penalty) 
+                // At high mountains (land_elevation=1.0): penalty = 0.95 (severe penalty)
+                let base_penalty = 0.15;
+                let mountain_penalty = 0.95;
+                let curve_steepness = 2.5; // Controls how quickly penalty increases with elevation
+                
+                base_penalty + (mountain_penalty - base_penalty) * land_elevation.powf(curve_steepness)
+            };
+            
+            let penalty_u8 = (terrain_penalty * 255.0f32).clamp(0.0f32, 255.0f32) as u8;
+            
+            // Store as RGBA: R=altitude, G=unused, B=unused, A=terrain_penalty
             terrain_data.push(altitude);
-            terrain_data.push(0u8); // Unused channel
-            terrain_data.push(0u8); // Unused channel  
-            terrain_data.push(255u8); // Full alpha
+            terrain_data.push(0u8); // Unused channel (humidity in future)
+            terrain_data.push(0u8); // Unused channel (temperature in future)
+            terrain_data.push(penalty_u8); // Terrain penalty for need propagation
         }
     }
     
@@ -81,7 +106,8 @@ fn get_elevation(noise: &Simplex, noise2: &Simplex, noise3: &Simplex, x: u32, y:
 pub struct EmpireSimulation {
     pub texture_a: wgpu::Texture,
     pub texture_b: wgpu::Texture,
-    pub terrain_texture: wgpu::Texture,  // Read-only terrain data (altitude, humidity, temperature)
+    pub terrain_texture: wgpu::Texture,  // Read-only terrain data (R=altitude, G=unused, B=unused, A=terrain_penalty)
+    pub empire_params_texture: wgpu::Texture,  // Read-only per-empire parameters (aggression, diplomacy, etc.)
     pub compute_bind_group_a: wgpu::BindGroup,
     pub compute_bind_group_b: wgpu::BindGroup,
     pub display_bind_group_a: wgpu::BindGroup,
@@ -100,6 +126,7 @@ pub struct EmpireSimulation {
     pub is_paused: bool,
     pub game_size: u32,
     pub frame_uniform_buffer: wgpu::Buffer,
+    pub num_empires: u8,  // Track number of empires for parameters texture size
 }
 
 impl EmpireSimulation {
@@ -218,10 +245,76 @@ impl EmpireSimulation {
             &terrain_data,
         );
         
+        // Create empire parameters texture (NxN where N is number of empires)
+        // Each pixel contains parameters for one empire vs all empires
+        // For now we'll use a reasonable maximum of 256 empires
+        let max_empires = 256u32;
+        let num_spawned_empires = (empire_id_counter - 1) as u8;
+        
+        println!("Creating empire parameters texture ({}x{}) for {} empires...", max_empires, max_empires, num_spawned_empires);
+        
+        // Generate empire parameters data
+        // Channel layout: R=diplomacy (opinion of other empire, 0-255), G=aggression (0-255), B=reserved, A=reserved
+        let mut empire_params_data = Vec::with_capacity((max_empires * max_empires * 4) as usize);
+        
+        // Initialize the parameters texture
+        for y in 0..max_empires {
+            for x in 0..max_empires {
+                let empire_id = (y + 1) as u8; // Empire IDs start from 1
+                let target_empire_id = (x + 1) as u8;
+                
+                let (diplomacy, aggression) = if empire_id <= num_spawned_empires {
+                    // Generate random diplomacy opinion for this empire vs target empire
+                    let mut hasher = DefaultHasher::new();
+                    (empire_id, target_empire_id, 54321u32).hash(&mut hasher); // Seed for consistency
+                    let diplomacy_random = (hasher.finish() % 256) as u8;
+                    
+                    // Generate random aggression for this empire (same for all targets)
+                    let mut hasher2 = DefaultHasher::new();
+                    (empire_id, 98765u32).hash(&mut hasher2);
+                    let aggression_random = (hasher2.finish() % 256) as u8;
+                    
+                    (diplomacy_random, aggression_random)
+                } else {
+                    (128u8, 128u8) // Neutral values for unused empire slots
+                };
+                
+                empire_params_data.extend_from_slice(&[
+                    diplomacy,  // R: Diplomacy/opinion (not used yet, but ready for future)
+                    aggression, // G: Aggression level (affects combat threshold)
+                    0u8,        // B: Reserved for future parameters
+                    255u8,      // A: Full alpha
+                ]);
+            }
+        }
+        
+        let empire_params_texture_desc = wgpu::TextureDescriptor {
+            label: Some("Empire Parameters Texture"),
+            size: wgpu::Extent3d {
+                width: max_empires,
+                height: max_empires,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        
+        let empire_params_texture = graphics.device.create_texture_with_data(
+            &graphics.queue,
+            &empire_params_texture_desc,
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &empire_params_data,
+        );
+        
         // Create texture views
         let game_view_a = texture_a.create_view(&wgpu::TextureViewDescriptor::default());
         let game_view_b = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
         let terrain_view = terrain_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let empire_params_view = empire_params_texture.create_view(&wgpu::TextureViewDescriptor::default());
         
         let texture_sampler = graphics.device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -285,6 +378,16 @@ impl EmpireSimulation {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    },
+                    count: None,
+                },
             ],
         });
         
@@ -326,6 +429,10 @@ impl EmpireSimulation {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&terrain_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&empire_params_view),
+                },
             ],
         });
         
@@ -348,6 +455,10 @@ impl EmpireSimulation {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&terrain_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&empire_params_view),
                 },
             ],
         });
@@ -529,6 +640,7 @@ impl EmpireSimulation {
             texture_a,
             texture_b,
             terrain_texture,
+            empire_params_texture,
             compute_bind_group_a,
             compute_bind_group_b,
             display_bind_group_a,
@@ -547,6 +659,7 @@ impl EmpireSimulation {
             is_paused: false,
             game_size,
             frame_uniform_buffer,
+            num_empires: num_spawned_empires,
         }
     }
     

@@ -140,6 +140,10 @@ impl State {
     fn toggle_fps_overlay(&mut self) {
         self.fps_tracker.toggle_visibility();
     }
+    
+    fn toggle_vsync(&mut self) {
+        self.graphics.toggle_vsync();
+    }
 }
 
 struct App {
@@ -188,6 +192,11 @@ impl ApplicationHandler for App {
                                 KeyCode::F3 => {
                                     if let Some(state) = &mut self.state {
                                         state.toggle_fps_overlay();
+                                    }
+                                },
+                                KeyCode::F4 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.toggle_vsync();
                                     }
                                 },
                                 KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD |
@@ -287,6 +296,7 @@ fn main() {
     println!("  WASD - Move camera around");
     println!("  Q/E - Zoom out/in");
     println!("  F3 - Toggle FPS overlay");
+    println!("  F4 - Toggle VSync");
     println!("  1 - Empires render mode (default)");
     println!("  2 - Strength heatmap mode");
     println!("  3 - Need heatmap mode");

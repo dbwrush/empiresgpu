@@ -34,6 +34,7 @@ pub struct GraphicsContext {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
+    pub vsync_enabled: bool,
 }
 
 impl GraphicsContext {
@@ -93,7 +94,7 @@ impl GraphicsContext {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Immediate, // Disable vsync for maximum FPS
+            present_mode: wgpu::PresentMode::Fifo, // Enable vsync by default
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -106,6 +107,7 @@ impl GraphicsContext {
             queue,
             config,
             size,
+            vsync_enabled: true, // Start with vsync enabled by default
         }
     }
     
@@ -116,6 +118,17 @@ impl GraphicsContext {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
         }
+    }
+    
+    pub fn toggle_vsync(&mut self) {
+        self.vsync_enabled = !self.vsync_enabled;
+        self.config.present_mode = if self.vsync_enabled {
+            wgpu::PresentMode::Fifo // Vsync enabled
+        } else {
+            wgpu::PresentMode::Immediate // Vsync disabled, maximum FPS
+        };
+        self.surface.configure(&self.device, &self.config);
+        println!("Vsync {}", if self.vsync_enabled { "enabled" } else { "disabled" });
     }
     
     pub fn create_quad_vertices(sim_size: f32) -> [Vertex; 6] {
