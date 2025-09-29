@@ -93,7 +93,7 @@ impl GraphicsContext {
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode: wgpu::PresentMode::Immediate, // Disable vsync for maximum FPS
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -139,8 +139,15 @@ impl GraphicsContext {
 }
 
 pub fn load_shader(device: &wgpu::Device, path: &str) -> wgpu::ShaderModule {
-    let shader_source = std::fs::read_to_string(path)
-        .unwrap_or_else(|_| panic!("Failed to read shader file: {}", path));
+    let shader_source = match path {
+        "shaders/empire_compute.wgsl" => include_str!("../../shaders/empire_compute.wgsl"),
+        "shaders/empire_render.wgsl" => include_str!("../../shaders/empire_render.wgsl"),
+        "shaders/empire_render_strength.wgsl" => include_str!("../../shaders/empire_render_strength.wgsl"),
+        "shaders/empire_render_need.wgsl" => include_str!("../../shaders/empire_render_need.wgsl"),
+        "shaders/empire_render_action.wgsl" => include_str!("../../shaders/empire_render_action.wgsl"),
+        "shaders/terrain_render.wgsl" => include_str!("../../shaders/terrain_render.wgsl"),
+        _ => panic!("Unknown shader path: {}", path),
+    };
     
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(path),
