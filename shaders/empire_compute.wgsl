@@ -13,6 +13,12 @@ var terrain_texture: texture_2d<f32>;
 @group(0) @binding(4)
 var empire_params_texture: texture_2d<f32>;
 
+@group(0) @binding(5)
+var aux_input_texture: texture_2d<f32>; // RGBA8Unorm auxiliary input texture (age data in red channel)
+
+@group(0) @binding(6)
+var aux_output_texture: texture_storage_2d<rgba8unorm, write>; // RGBA8Unorm auxiliary output texture
+
 // High-quality pseudorandom number generator using PCG algorithm
 // Returns a pseudorandom u32 based on position and frame
 fn pcg_hash(x: u32, y: u32, frame: u32) -> u32 {
@@ -75,6 +81,17 @@ fn get_empire_params(empire_id: u32) -> vec4<f32> {
     // For aggression, we use the empire's own row (doesn't matter which column)
     let empire_pos = vec2<i32>(0, i32(empire_id - 1u)); // Use first column for aggression
     return textureLoad(empire_params_texture, empire_pos, 0);
+}
+
+// Get auxiliary data (age) at position with wrapping - returns normalized float 0.0-1.0
+fn get_aux_data(pos: vec2<i32>) -> f32 {
+    let dims = textureDimensions(aux_input_texture);
+    let wrapped_pos = vec2<i32>(
+        (pos.x + i32(dims.x)) % i32(dims.x),
+        (pos.y + i32(dims.y)) % i32(dims.y)
+    );
+    let aux_data = textureLoad(aux_input_texture, wrapped_pos, 0);
+    return aux_data.r; // Age is stored in red channel as normalized float (0.0-1.0)
 }
 
 // Convert float [0,1] to u8 [0,255]
@@ -151,6 +168,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let strength = float_to_u8(current_cell.g);
     let need = float_to_u8(current_cell.b);
     let action = float_to_u8(current_cell.a);
+    
+    // Read current age data
+    let current_age = get_aux_data(pos);
     
     // Read terrain data (for AI decisions and water detection)
     let terrain = get_terrain(pos);
@@ -486,6 +506,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     
+    // Calculate age for auxiliary texture
+    var new_age: f32;
+    if (new_empire_id == 0u) {
+        // No empire - no age data
+        new_age = 0.0;
+    } else if (new_empire_id != empire_id) {
+        // Ownership changed - reset age to small value (so it shows up as new territory)
+        new_age = 0.004; // Just above zero to be visible
+    } else {
+        // Ownership unchanged - increment age logarithmically
+        // Age increases quickly when young, slows down as it gets older
+        // Work in normalized 0.0-1.0 space to preserve fractional increments
+        
+        // Use logarithmic growth: increment = base_rate / (1 + age/scale)
+        // This gives fast growth initially, slowing down asymptotically
+        let base_rate = 0.02;     // Increment per frame when age is near 0
+        let age_scale = 0.15;     // Controls how quickly aging slows down
+        
+        let increment = base_rate / (1.0 + current_age / age_scale);
+        new_age = min(current_age + increment, 1.0); // Cap at 1.0
+    }
+    
     // Write the new cell state
     let output_color = vec4<f32>(
         u8_to_float(new_empire_id),
@@ -495,4 +537,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     );
     
     textureStore(output_texture, pos, output_color);
+    
+    // Write auxiliary data (age) to auxiliary texture - stored as normalized float
+    textureStore(aux_output_texture, pos, vec4<f32>(new_age, 0.0, 0.0, 1.0));
 }

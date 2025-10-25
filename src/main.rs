@@ -226,6 +226,11 @@ impl ApplicationHandler for App {
                                         state.simulation.set_render_mode(RenderMode::Action);
                                     }
                                 },
+                                KeyCode::Digit5 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::Age);
+                                    }
+                                },
                                 _ => {}
                             }
                         },
@@ -301,6 +306,7 @@ fn main() {
     println!("  2 - Strength heatmap mode");
     println!("  3 - Need heatmap mode");
     println!("  4 - Action visualization mode");
+    println!("  5 - Age visualization mode (red=new, green=old)");
     println!("  Left Click - Claim territory for Empire 1 (unique color)");
     println!("  Right Click - Unclaim territory");
     println!("  ESC - Exit");

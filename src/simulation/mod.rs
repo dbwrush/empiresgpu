@@ -8,6 +8,7 @@ pub enum RenderMode {
     Strength = 1,
     Need = 2,
     Action = 3,
+    Age = 4,
 }
 
 // Generate terrain data using simplex noise with cylindrical world wrapping
@@ -108,16 +109,21 @@ pub struct EmpireSimulation {
     pub texture_b: wgpu::Texture,
     pub terrain_texture: wgpu::Texture,  // Read-only terrain data (R=altitude, G=unused, B=unused, A=terrain_penalty)
     pub empire_params_texture: wgpu::Texture,  // Read-only per-empire parameters (aggression, diplomacy, etc.)
+    pub aux_texture_a: wgpu::Texture,    // Auxiliary data texture A (currently: age tracking, future: other dynamic data)
+    pub aux_texture_b: wgpu::Texture,    // Auxiliary data texture B (ping-pong with A)
     pub compute_bind_group_a: wgpu::BindGroup,
     pub compute_bind_group_b: wgpu::BindGroup,
     pub display_bind_group_a: wgpu::BindGroup,
     pub display_bind_group_b: wgpu::BindGroup,
+    pub aux_bind_group_a: wgpu::BindGroup,       // Bind group for auxiliary texture A rendering
+    pub aux_bind_group_b: wgpu::BindGroup,       // Bind group for auxiliary texture B rendering
     pub terrain_bind_group: wgpu::BindGroup,     // For terrain rendering
     pub compute_pipeline: wgpu::ComputePipeline,
     pub render_pipeline_empires: wgpu::RenderPipeline,
     pub render_pipeline_strength: wgpu::RenderPipeline,
     pub render_pipeline_need: wgpu::RenderPipeline,
     pub render_pipeline_action: wgpu::RenderPipeline,
+    pub render_pipeline_age: wgpu::RenderPipeline,
     pub terrain_pipeline: wgpu::RenderPipeline,  // For terrain rendering
     pub current_render_mode: RenderMode,
     pub current_is_a: bool,
@@ -149,47 +155,48 @@ impl EmpireSimulation {
         println!("Creating Empire simulation textures with size {}x{}...", game_size, game_size);
         
         // Generate initial empire map with random empires on land cells
-        let mut initial_data = Vec::new();
+        let mut initial_data = vec![0u8; (game_size * game_size * 4) as usize];
         let mut empire_id_counter = 1u8; // Start from 1 since 0 means unclaimed
-        let empire_spawn_chance = 0.005; // 0.5% chance per land cell
         
-        // Use a simple RNG for spawning (we can make this more sophisticated later)
+        // Use a simple RNG for spawning
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
+        // First pass: collect all valid land positions
+        let mut land_positions = Vec::new();
         for y in 0..game_size {
             for x in 0..game_size {
-                // Channel layout: R=Empire ID, G=Strength, B=Need, A=Action
-                
-                // Check if this is a land cell (elevation > ocean cutoff)
                 let terrain_idx = ((y * game_size + x) * 4) as usize;
                 let elevation = terrain_data[terrain_idx] as f32 / 255.0;
                 let is_land = elevation > 0.53; // Same ocean cutoff as terrain generation
                 
-                let (empire_id, strength) = if is_land {
-                    // Calculate pseudo-random value for this cell
-                    let mut hasher = DefaultHasher::new();
-                    (x, y, 12345u32).hash(&mut hasher); // Include seed for consistency
-                    let random_val = (hasher.finish() % 1000) as f32 / 1000.0;
-                    
-                    if random_val < empire_spawn_chance && empire_id_counter < 255 {
-                        let id = empire_id_counter;
-                        empire_id_counter += 1;
-                        println!("  -> Spawning Empire {} at ({}, {})", id, x, y);
-                        (id, 200u8) // Start with 200 strength
-                    } else {
-                        (0u8, 0u8) // Unclaimed
-                    }
-                } else {
-                    (0u8, 0u8) // Ocean cells remain unclaimed
-                };
-                
-                initial_data.extend_from_slice(&[
-                    empire_id, // R: Empire ID
-                    strength,  // G: Strength
-                    0u8,       // B: Need (starts at 0)
-                    0u8,       // A: Action (no action)
-                ]);
+                if is_land {
+                    land_positions.push((x, y));
+                }
+            }
+        }
+        
+        // Shuffle the land positions using a deterministic shuffle based on hashing
+        for i in (1..land_positions.len()).rev() {
+            let mut hasher = DefaultHasher::new();
+            (i, 54321u32).hash(&mut hasher); // Seed for shuffle consistency
+            let j = (hasher.finish() as usize) % (i + 1);
+            land_positions.swap(i, j);
+        }
+        
+        // Spawn empires on shuffled land positions
+        let empire_spawn_chance = 0.005; // 0.5% chance per land cell
+        for (x, y) in &land_positions {
+            let mut hasher = DefaultHasher::new();
+            (*x, *y, 12345u32).hash(&mut hasher);
+            let random_val = (hasher.finish() % 1000) as f32 / 1000.0;
+            
+            if random_val < empire_spawn_chance && empire_id_counter < 255 {
+                let idx = ((y * game_size + x) * 4) as usize;
+                initial_data[idx] = empire_id_counter;     // R: Empire ID
+                initial_data[idx + 1] = 200u8;             // G: Strength
+                println!("  -> Spawning Empire {} at ({}, {})", empire_id_counter, x, y);
+                empire_id_counter += 1;
             }
         }
         
@@ -310,11 +317,44 @@ impl EmpireSimulation {
             &empire_params_data,
         );
         
+        // Create auxiliary textures for dynamic data (age tracking, etc.)
+        // Use RGBA8Unorm format for maximum compatibility (same as main simulation texture)
+        println!("Creating auxiliary textures for age tracking and future dynamic data...");
+        
+        let aux_texture_desc = wgpu::TextureDescriptor {
+            label: Some("Auxiliary Data Texture"),
+            size: wgpu::Extent3d {
+                width: game_size,
+                height: game_size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm, // Same format as main texture for compatibility
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        
+        // Initialize auxiliary data (all zeros = age 0)
+        let aux_data = vec![0u8; (game_size * game_size * 4) as usize]; // 4 bytes per pixel for RGBA8
+        
+        let aux_texture_a = graphics.device.create_texture_with_data(
+            &graphics.queue,
+            &aux_texture_desc,
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &aux_data,
+        );
+        
+        let aux_texture_b = graphics.device.create_texture(&aux_texture_desc);
+        
         // Create texture views
         let game_view_a = texture_a.create_view(&wgpu::TextureViewDescriptor::default());
         let game_view_b = texture_b.create_view(&wgpu::TextureViewDescriptor::default());
         let terrain_view = terrain_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let empire_params_view = empire_params_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let aux_view_a = aux_texture_a.create_view(&wgpu::TextureViewDescriptor::default());
+        let aux_view_b = aux_texture_b.create_view(&wgpu::TextureViewDescriptor::default());
         
         let texture_sampler = graphics.device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -388,6 +428,26 @@ impl EmpireSimulation {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
             ],
         });
         
@@ -433,6 +493,14 @@ impl EmpireSimulation {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&empire_params_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&aux_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&aux_view_b),
+                },
             ],
         });
         
@@ -459,6 +527,14 @@ impl EmpireSimulation {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&empire_params_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&aux_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::TextureView(&aux_view_a),
                 },
             ],
         });
@@ -509,6 +585,37 @@ impl EmpireSimulation {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::TextureView(&game_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+            ],
+        });
+        
+        // Create auxiliary bind groups for rendering auxiliary data (age, etc.)
+        let aux_bind_group_a = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Auxiliary Bind Group A"),
+            layout: &display_bind_group_layout, // Reuse same layout as display 
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&aux_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+            ],
+        });
+        
+        let aux_bind_group_b = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Auxiliary Bind Group B"),
+            layout: &display_bind_group_layout, // Reuse same layout as display
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&aux_view_b),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -571,6 +678,7 @@ impl EmpireSimulation {
         let render_pipeline_strength = create_render_pipeline("shaders/empire_render_strength.wgsl", "Strength Render Pipeline");
         let render_pipeline_need = create_render_pipeline("shaders/empire_render_need.wgsl", "Need Render Pipeline");
         let render_pipeline_action = create_render_pipeline("shaders/empire_render_action.wgsl", "Action Render Pipeline");
+        let render_pipeline_age = create_render_pipeline("shaders/empire_render_age.wgsl", "Age Render Pipeline");
         
         // Create terrain bind group for rendering
         let terrain_bind_group = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -641,16 +749,21 @@ impl EmpireSimulation {
             texture_b,
             terrain_texture,
             empire_params_texture,
+            aux_texture_a,
+            aux_texture_b,
             compute_bind_group_a,
             compute_bind_group_b,
             display_bind_group_a,
             display_bind_group_b,
+            aux_bind_group_a,
+            aux_bind_group_b,
             terrain_bind_group,
             compute_pipeline,
             render_pipeline_empires,
             render_pipeline_strength,
             render_pipeline_need,
             render_pipeline_action,
+            render_pipeline_age,
             terrain_pipeline,
             current_render_mode: RenderMode::Empires,
             current_is_a: true,
@@ -776,6 +889,7 @@ impl EmpireSimulation {
                 RenderMode::Strength => "Strength Heatmap (blue=weak, red=strong)",
                 RenderMode::Need => "Need Heatmap (green=low, yellow=med, red=high)",
                 RenderMode::Action => "Action Visualization (blue=reinforce, red=attack)",
+                RenderMode::Age => "Age Visualization (red=new, green=old)",
             };
             println!("🎨 Switched to render mode: {}", mode_name);
         }
@@ -801,14 +915,28 @@ impl EmpireSimulation {
             RenderMode::Strength => &self.render_pipeline_strength,
             RenderMode::Need => &self.render_pipeline_need,
             RenderMode::Action => &self.render_pipeline_action,
+            RenderMode::Age => &self.render_pipeline_age,
         };
         render_pass.set_pipeline(current_pipeline);
         
-        // Use the current texture for display
-        let display_bind_group = if self.current_is_a {
-            &self.display_bind_group_a
-        } else {
-            &self.display_bind_group_b
+        // Use the appropriate texture for display based on render mode
+        let display_bind_group = match self.current_render_mode {
+            RenderMode::Age => {
+                // Use auxiliary textures for age visualization
+                if self.current_is_a {
+                    &self.aux_bind_group_a
+                } else {
+                    &self.aux_bind_group_b
+                }
+            }
+            _ => {
+                // Use main game textures for all other modes
+                if self.current_is_a {
+                    &self.display_bind_group_a
+                } else {
+                    &self.display_bind_group_b
+                }
+            }
         };
         
         render_pass.set_bind_group(0, display_bind_group, &[]);
