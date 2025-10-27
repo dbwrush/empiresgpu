@@ -132,7 +132,7 @@ pub struct EmpireSimulation {
     pub is_paused: bool,
     pub game_size: u32,
     pub frame_uniform_buffer: wgpu::Buffer,
-    pub num_empires: u8,  // Track number of empires for parameters texture size
+    pub num_empires: u16,  // Track number of empires for parameters texture size (16-bit for 65535 empires)
 }
 
 impl EmpireSimulation {
@@ -155,8 +155,8 @@ impl EmpireSimulation {
         println!("Creating Empire simulation textures with size {}x{}...", game_size, game_size);
         
         // Generate initial empire map with random empires on land cells
-        let mut initial_data = vec![0u8; (game_size * game_size * 4) as usize];
-        let mut empire_id_counter = 1u8; // Start from 1 since 0 means unclaimed
+        let mut initial_data = vec![0u16; (game_size * game_size * 4) as usize]; // 16-bit values
+        let mut empire_id_counter = 1u16; // Start from 1 since 0 means unclaimed (16-bit now)
         
         // Use a simple RNG for spawning
         use std::collections::hash_map::DefaultHasher;
@@ -191,10 +191,10 @@ impl EmpireSimulation {
             (*x, *y, 12345u32).hash(&mut hasher);
             let random_val = (hasher.finish() % 1000) as f32 / 1000.0;
             
-            if random_val < empire_spawn_chance && empire_id_counter < 255 {
+            if random_val < empire_spawn_chance && empire_id_counter < 65535 {
                 let idx = ((y * game_size + x) * 4) as usize;
                 initial_data[idx] = empire_id_counter;     // R: Empire ID
-                initial_data[idx + 1] = 200u8;             // G: Strength
+                initial_data[idx + 1] = 10000u16;          // G: Strength (scaled up from 200 to ~10000 for 16-bit)
                 println!("  -> Spawning Empire {} at ({}, {})", empire_id_counter, x, y);
                 empire_id_counter += 1;
             }
@@ -213,18 +213,23 @@ impl EmpireSimulation {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: wgpu::TextureFormat::Rgba16Unorm, // 16-bit for extended range (0-65535)
             usage: wgpu::TextureUsages::TEXTURE_BINDING 
                 | wgpu::TextureUsages::STORAGE_BINDING 
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         };
         
+        // Convert u16 data to bytes for texture upload
+        let initial_data_bytes: Vec<u8> = initial_data.iter()
+            .flat_map(|&value| value.to_ne_bytes())
+            .collect();
+        
         let texture_a = graphics.device.create_texture_with_data(
             &graphics.queue,
             &texture_desc,
             wgpu::util::TextureDataOrder::LayerMajor,
-            &initial_data,
+            &initial_data_bytes,
         );
         
         let texture_b = graphics.device.create_texture(&texture_desc);
@@ -256,7 +261,7 @@ impl EmpireSimulation {
         // Each pixel contains parameters for one empire vs all empires
         // For now we'll use a reasonable maximum of 256 empires
         let max_empires = 256u32;
-        let num_spawned_empires = (empire_id_counter - 1) as u8;
+        let num_spawned_empires = (empire_id_counter - 1) as u16;
         
         println!("Creating empire parameters texture ({}x{}) for {} empires...", max_empires, max_empires, num_spawned_empires);
         
@@ -267,8 +272,8 @@ impl EmpireSimulation {
         // Initialize the parameters texture
         for y in 0..max_empires {
             for x in 0..max_empires {
-                let empire_id = (y + 1) as u8; // Empire IDs start from 1
-                let target_empire_id = (x + 1) as u8;
+                let empire_id = (y + 1) as u16; // Empire IDs start from 1 (16-bit now)
+                let target_empire_id = (x + 1) as u16;
                 
                 let (diplomacy, aggression) = if empire_id <= num_spawned_empires {
                     // Generate random diplomacy opinion for this empire vs target empire
@@ -318,7 +323,7 @@ impl EmpireSimulation {
         );
         
         // Create auxiliary textures for dynamic data (age tracking, etc.)
-        // Use RGBA8Unorm format for maximum compatibility (same as main simulation texture)
+        // Use RGBA16Unorm format for better precision (matches main simulation texture)
         println!("Creating auxiliary textures for age tracking and future dynamic data...");
         
         let aux_texture_desc = wgpu::TextureDescriptor {
@@ -331,13 +336,13 @@ impl EmpireSimulation {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm, // Same format as main texture for compatibility
+            format: wgpu::TextureFormat::Rgba16Unorm, // 16-bit per channel for better precision
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         };
         
         // Initialize auxiliary data (all zeros = age 0)
-        let aux_data = vec![0u8; (game_size * game_size * 4) as usize]; // 4 bytes per pixel for RGBA8
+        let aux_data = vec![0u8; (game_size * game_size * 8) as usize]; // 8 bytes per pixel for RGBA16
         
         let aux_texture_a = graphics.device.create_texture_with_data(
             &graphics.queue,
@@ -346,7 +351,13 @@ impl EmpireSimulation {
             &aux_data,
         );
         
-        let aux_texture_b = graphics.device.create_texture(&aux_texture_desc);
+        // Initialize aux_texture_b with the same data (both textures must start with same state)
+        let aux_texture_b = graphics.device.create_texture_with_data(
+            &graphics.queue,
+            &aux_texture_desc,
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &aux_data,
+        );
         
         // Create texture views
         let game_view_a = texture_a.create_view(&wgpu::TextureViewDescriptor::default());
@@ -393,7 +404,7 @@ impl EmpireSimulation {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: wgpu::TextureFormat::Rgba16Unorm, // Match shader 16-bit format
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -443,7 +454,7 @@ impl EmpireSimulation {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: wgpu::TextureFormat::Rgba16Unorm,
                         view_dimension: wgpu::TextureViewDimension::D2,
                     },
                     count: None,
@@ -839,12 +850,18 @@ impl EmpireSimulation {
         println!("Claiming cell at ({}, {}) for Empire {} (Frame: {})", x, y, empire_id, self.frame_count);
         
         // Create empire cell data (Channel layout: R=Empire ID, G=Strength, B=Need, A=Action)
-        let cell_data: [u8; 4] = [
-            empire_id,  // R: Empire ID
-            200,        // G: Strength (higher initial strength to survive terrain penalties)
-            64,         // B: Need (default need)
-            0,          // A: Action (no initial action, will be set by compute shader)
-        ];
+        // Now using 16-bit values (u16) - 8 bytes total per pixel
+        let empire_id_u16 = empire_id as u16;
+        let strength_u16: u16 = 10000; // Higher initial strength (16-bit range)
+        let need_u16: u16 = 3000;      // Default need (16-bit range)
+        let action_u16: u16 = 0;       // No initial action
+        
+        // Convert to bytes in little-endian format
+        let mut cell_data = Vec::new();
+        cell_data.extend_from_slice(&empire_id_u16.to_le_bytes());
+        cell_data.extend_from_slice(&strength_u16.to_le_bytes());
+        cell_data.extend_from_slice(&need_u16.to_le_bytes());
+        cell_data.extend_from_slice(&action_u16.to_le_bytes());
         
         // Write to both textures to ensure the cell persists through ping-pong
         for texture in [&self.texture_a, &self.texture_b] {
@@ -861,7 +878,7 @@ impl EmpireSimulation {
                 // Data layout
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(4), // 4 bytes per pixel (Rgba8Unorm)
+                    bytes_per_row: Some(8), // 8 bytes per pixel (Rgba16Unorm)
                     rows_per_image: Some(1), // Single pixel
                 },
                 // Size
@@ -923,10 +940,13 @@ impl EmpireSimulation {
         let display_bind_group = match self.current_render_mode {
             RenderMode::Age => {
                 // Use auxiliary textures for age visualization
+                // After the flip, current_is_a indicates which texture was just WRITTEN to
+                // If current_is_a is true, we just wrote to A (because we were reading from B)
+                // If current_is_a is false, we just wrote to B (because we were reading from A)
                 if self.current_is_a {
-                    &self.aux_bind_group_a
+                    &self.aux_bind_group_a // Show A (just written)
                 } else {
-                    &self.aux_bind_group_b
+                    &self.aux_bind_group_b // Show B (just written)
                 }
             }
             _ => {

@@ -48,7 +48,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let cell_data = textureSample(t_texture, s_texture, adjusted_tex_coords);
     let empire_id = cell_data.r;
-    let need = cell_data.b;         // Need value (0.0 to 1.0)
+    let need = cell_data.b;         // Need value (0.0 to 1.0, representing 0-65535 in 16-bit)
     
     // Visualize need levels as a heatmap
     if (empire_id == 0.0) {
@@ -56,11 +56,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
         // Create a green-to-yellow-to-red heatmap for need
+        // Adjust the range to show more detail in the typical need values (0.0-0.3 range)
+        let adjusted_need = clamp(need * 3.5, 0.0, 1.0); // Scale up to see more variation
+        
         var need_color = vec3<f32>(0.0, 0.0, 0.0);
-        if (need < 0.5) {
-            need_color = vec3<f32>(need * 2.0, 1.0, 0.0);  // Green to yellow
+        if (adjusted_need < 0.5) {
+            need_color = vec3<f32>(adjusted_need * 2.0, 1.0, 0.0);  // Green to yellow
         } else {
-            need_color = vec3<f32>(1.0, (1.0 - need) * 2.0, 0.0);  // Yellow to red
+            need_color = vec3<f32>(1.0, (1.0 - adjusted_need) * 2.0, 0.0);  // Yellow to red
         }
         return vec4<f32>(need_color, 0.8);
     }

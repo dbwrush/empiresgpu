@@ -2,7 +2,7 @@
 var input_texture: texture_2d<f32>;
 
 @group(0) @binding(1)
-var output_texture: texture_storage_2d<rgba8unorm, write>;
+var output_texture: texture_storage_2d<rgba16unorm, write>;
 
 @group(0) @binding(2)
 var<uniform> frame_data: u32;
@@ -14,10 +14,10 @@ var terrain_texture: texture_2d<f32>;
 var empire_params_texture: texture_2d<f32>;
 
 @group(0) @binding(5)
-var aux_input_texture: texture_2d<f32>; // RGBA8Unorm auxiliary input texture (age data in red channel)
+var aux_input_texture: texture_2d<f32>; // RGBA16Unorm auxiliary input texture (age data in red channel)
 
 @group(0) @binding(6)
-var aux_output_texture: texture_storage_2d<rgba8unorm, write>; // RGBA8Unorm auxiliary output texture
+var aux_output_texture: texture_storage_2d<rgba16unorm, write>; // RGBA16Unorm auxiliary output texture
 
 // High-quality pseudorandom number generator using PCG algorithm
 // Returns a pseudorandom u32 based on position and frame
@@ -94,14 +94,14 @@ fn get_aux_data(pos: vec2<i32>) -> f32 {
     return aux_data.r; // Age is stored in red channel as normalized float (0.0-1.0)
 }
 
-// Convert float [0,1] to u8 [0,255]
-fn float_to_u8(val: f32) -> u32 {
-    return u32(clamp(val * 255.0, 0.0, 255.0));
+// Convert float [0,1] to u16 [0,65535]
+fn float_to_u16(val: f32) -> u32 {
+    return u32(clamp(val * 65535.0, 0.0, 65535.0));
 }
 
-// Convert u8 [0,255] to float [0,1]
-fn u8_to_float(val: u32) -> f32 {
-    return f32(val) / 255.0;
+// Convert u16 [0,65535] to float [0,1]
+fn u16_to_float(val: u32) -> f32 {
+    return f32(val) / 65535.0;
 }
 
 // Get hex neighbor offset based on direction (0-5) and row parity
@@ -164,10 +164,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
     
     let current_cell = get_cell(pos);
-    let empire_id = float_to_u8(current_cell.r);
-    let strength = float_to_u8(current_cell.g);
-    let need = float_to_u8(current_cell.b);
-    let action = float_to_u8(current_cell.a);
+    let empire_id = float_to_u16(current_cell.r);
+    let strength = float_to_u16(current_cell.g);
+    let need = float_to_u16(current_cell.b);
+    let action = float_to_u16(current_cell.a);
     
     // Read current age data
     let current_age = get_aux_data(pos);
@@ -193,6 +193,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var new_strength = strength;
     var new_need = need;
     var new_action = action;
+    var new_age = current_age; // Default: preserve current age
     
     // If this is water, clear any empire presence
     if (is_water) {
@@ -200,12 +201,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         new_strength = 0u;
         new_need = 0u;
         new_action = 0u;
+        new_age = 0.0;
     } else {
         // Handle unclaimed land cells - set initial strength based on terrain
         if (empire_id == 0u && strength == 0u) {
-            // Convert terrain altitude to initial strength (0-255 range)
+            // Convert terrain altitude to initial strength (16-bit range)
             // DEBUG: Much lower initial strength to allow expansion testing
-            new_strength = u32(altitude * 50.0); // DEBUG: Much weaker initial strength
+            new_strength = u32(altitude * 3000.0); // DEBUG: Much weaker initial strength (scaled for 16-bit)
         }
         
         // PHASE 1: Handle incoming attacks and reinforcements
@@ -219,9 +221,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
             let neighbor_pos = pos + neighbor_offset;
             let neighbor_cell = get_cell(neighbor_pos);
-            let neighbor_empire = float_to_u8(neighbor_cell.r);
-            let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
-            let neighbor_action = float_to_u8(neighbor_cell.a);
+            let neighbor_empire = float_to_u16(neighbor_cell.r);
+            let neighbor_strength = f32(float_to_u16(neighbor_cell.g)) / 65535.0;
+            let neighbor_action = float_to_u16(neighbor_cell.a);
             
             // If neighbor has a valid action targeting this cell
             if (neighbor_empire != 0u && neighbor_action != 0u) {
@@ -263,7 +265,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
         
         // Apply reinforcements and combat resolution
-        var current_strength_f = f32(new_strength) / 255.0;
+        var current_strength_f = f32(new_strength) / 65535.0;
         current_strength_f += total_reinforcement_strength;
         
         // New attrition-based combat resolution
@@ -278,18 +280,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             if (total_attack_strength >= required_strength_for_conquest && current_strength_f <= 0.0) {
                 // Full conquest: attacker wins and occupies with remaining strength
                 new_empire_id = attacking_empire;
-                let remaining_attack_strength = total_attack_strength - (f32(strength) / 255.0 * 3.0);
-                new_strength = u32(clamp(remaining_attack_strength * 255.0, 20.0, 255.0)); // Minimum 20 strength
-                new_need = 64u; // Reset need for newly conquered cell
+                let remaining_attack_strength = total_attack_strength - (f32(strength) / 65535.0 * 3.0);
+                new_strength = u32(clamp(remaining_attack_strength * 65535.0, 1000.0, 65535.0)); // Minimum 1000 strength
+                new_need = 3000u; // Reset need for newly conquered cell
+                new_age = 0.0; // Reset age for newly conquered cell
             } else {
                 // Attrition only: defender survives but is weakened
                 current_strength_f = max(current_strength_f, 0.01); // Minimum survival strength
-                new_strength = u32(clamp(current_strength_f * 255.0, 1.0, 255.0));
+                new_strength = u32(clamp(current_strength_f * 65535.0, 1.0, 65535.0));
                 // Empire ID and need remain unchanged
             }
         } else {
             // No combat, just apply reinforcements
-            new_strength = u32(clamp(current_strength_f * 255.0, 0.0, 255.0));
+            new_strength = u32(clamp(current_strength_f * 65535.0, 0.0, 65535.0));
         }
         
         // PHASE 2: Generate strength, calculate need, and make decisions for occupied cells
@@ -309,9 +312,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
                 let neighbor_pos = pos + neighbor_offset;
                 let neighbor_cell = get_cell(neighbor_pos);
-                let neighbor_empire = float_to_u8(neighbor_cell.r);
-                let neighbor_strength = f32(float_to_u8(neighbor_cell.g)) / 255.0;
-                let neighbor_need = f32(float_to_u8(neighbor_cell.b)) / 255.0;
+                let neighbor_empire = float_to_u16(neighbor_cell.r);
+                let neighbor_strength = f32(float_to_u16(neighbor_cell.g)) / 65535.0;
+                let neighbor_need = f32(float_to_u16(neighbor_cell.b)) / 65535.0;
                 
                 // Check if neighbor is water
                 let neighbor_terrain = get_terrain(neighbor_pos);
@@ -366,25 +369,27 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let need_factor = ((-altitude) / (1.0 - ocean_cutoff)) + (1.0 / (1.0 - ocean_cutoff));
             calculated_need *= need_factor;
             
-            // CRITICAL: Terrain-aware need propagation to discourage mountain border gore
-            // High terrain penalty (mountains) severely reduces need propagation efficiency
-            // This encourages empires to prefer coastal/lowland reinforcement routes
-            let base_propagation_efficiency = 0.95; // High base efficiency in good terrain
+            // GRADIENT-BASED need propagation for long-range signal transmission
+            // Instead of multiplicative decay, use additive cost (linear gradient)
+            // This allows need signals to travel hundreds or thousands of cells
             
-            // Exponential decay based on terrain penalty - mountains block need signals effectively
-            // Ocean/plains (penalty=0.05-0.15): 90-85% propagation efficiency  
-            // Hills (penalty=0.45): 65% propagation efficiency
-            // Mountains (penalty=0.95): 15% propagation efficiency (severe blocking)
-            let propagation_efficiency = base_propagation_efficiency * (1.0 - terrain_penalty * 0.85);
+            // Distance cost per cell (normalized 0-1 space)
+            // Good terrain: 0.0005-0.001 cost (~1000-2000 cell range)
+            // Bad terrain: 0.002-0.004 cost (~250-500 cell range)
+            let base_distance_cost = 0.0008; // Base cost per hop in good terrain
+            let terrain_cost_multiplier = 1.0 + (terrain_penalty * 3.0); // Mountains cost 4x more
+            let distance_cost = base_distance_cost * terrain_cost_multiplier;
             
-            let propagated_need = max_friendly_need * propagation_efficiency;
+            // Propagate need as gradient: neighbor_need - distance_cost
+            // This creates a linear decay instead of exponential
+            let propagated_need = max(max_friendly_need - distance_cost, 0.0);
             calculated_need = calculated_need + propagated_need;
             
-            // Update need value
-            new_need = u32(clamp(calculated_need * 255.0, 0.0, 255.0));
+            // Update need value (16-bit range now)
+            new_need = u32(clamp(calculated_need * 65535.0, 0.0, 65535.0));
             
             // Apply severe terrain penalties to discourage mountain occupation
-            var current_strength_f = f32(new_strength) / 255.0;
+            var current_strength_f = f32(new_strength) / 65535.0;
             
             // Harsh logistics penalty in difficult terrain - mountains are expensive to hold
             // Ocean/plains (penalty=0.05-0.15): 95-85% strength retention
@@ -456,12 +461,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 }
                 
                 // If no safe attack was possible, consider reinforcement 
-                if (new_action == 6u && max_need_direction < 6u && max_friendly_need > (f32(need) / 255.0)) {
-                    let my_need = f32(need) / 255.0;
-                    let need_ratio = max_friendly_need / max(my_need, 0.01); // Avoid division by zero
+                if (new_action == 6u && max_need_direction < 6u && max_friendly_need > (f32(need) / 65535.0)) {
+                    let my_need = f32(need) / 65535.0;
                     
-                    // Only reinforce if the need difference is significant enough to justify the risk
-                    if (need_ratio > 1.2) { // At least 20% more need
+                    // With gradient-based propagation, adjacent cells have very similar needs
+                    // Use absolute difference instead of ratio to detect gradient direction
+                    let need_difference = max_friendly_need - my_need;
+                    
+                    // Only reinforce if neighbor has ANY higher need (gradient flows uphill)
+                    // This works because our gradient decay is very gentle (0.0008 per hop)
+                    if (need_difference > 0.0001) { // Tiny threshold to avoid floating point errors
                         // Calculate safe transfer amount that won't compromise our defense
                         let base_transfer_rate = 0.2; // Conservative transfer rate
                         let need_factor = 1.0 - (my_need * 0.8); // Keep more if we also have high need
@@ -493,7 +502,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
             
             // Update final strength
-            new_strength = u32(clamp(current_strength_f * 255.0, 0.0, 255.0));
+            new_strength = u32(clamp(current_strength_f * 65535.0, 0.0, 65535.0));
             
             // DEBUG: Disable empire extinction for now to debug other issues
             // Empire extinction: isolated cells have chance to die
@@ -506,34 +515,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     
-    // Calculate age for auxiliary texture
-    var new_age: f32;
-    if (new_empire_id == 0u) {
-        // No empire - no age data
-        new_age = 0.0;
-    } else if (new_empire_id != empire_id) {
-        // Ownership changed - reset age to small value (so it shows up as new territory)
-        new_age = 0.004; // Just above zero to be visible
-    } else {
-        // Ownership unchanged - increment age logarithmically
-        // Age increases quickly when young, slows down as it gets older
-        // Work in normalized 0.0-1.0 space to preserve fractional increments
-        
-        // Use logarithmic growth: increment = base_rate / (1 + age/scale)
-        // This gives fast growth initially, slowing down asymptotically
-        let base_rate = 0.02;     // Increment per frame when age is near 0
-        let age_scale = 0.15;     // Controls how quickly aging slows down
-        
-        let increment = base_rate / (1.0 + current_age / age_scale);
-        new_age = min(current_age + increment, 1.0); // Cap at 1.0
+    // Increment age for cells that have an empire and didn't just get conquered
+    // (new_age is already set to 0.0 during conquest above)
+    if (new_empire_id != 0u) {
+        if (new_age < 0.0001) {
+            // Just conquered or initial spawn - start at a small visible value
+            // With 16-bit precision, we can use much smaller values (1/65535 ≈ 0.000015)
+            new_age = 0.001; // Start at visible red
+        } else {
+            // Existing cell - increment age logarithmically
+            // With 16-bit precision, we can use much smaller increments
+            let base_rate = 0.0001; // Small increment per frame (~10,000 frames to reach 1.0)
+            let increment = base_rate / (new_age + 1.0);
+            new_age = min(new_age + increment, 1.0); // Cap at 1.0
+        }
     }
     
     // Write the new cell state
     let output_color = vec4<f32>(
-        u8_to_float(new_empire_id),
-        u8_to_float(new_strength),
-        u8_to_float(new_need),
-        u8_to_float(new_action)
+        u16_to_float(new_empire_id),
+        u16_to_float(new_strength),
+        u16_to_float(new_need),
+        u16_to_float(new_action)
     );
     
     textureStore(output_texture, pos, output_color);

@@ -49,12 +49,25 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Apply hex offset for visual representation
+    let texture_dims = textureDimensions(aux_texture);
+    let pixel_coords = in.tex_coords * vec2<f32>(f32(texture_dims.x), f32(texture_dims.y));
+    let row = i32(pixel_coords.y);
+    
+    // For hex grid visualization, offset even rows by 0.5 pixels (even-r layout)
+    var adjusted_tex_coords = in.tex_coords;
+    if ((row % 2) == 0) {
+        // Offset even rows by half a pixel width
+        adjusted_tex_coords.x -= 0.5 / f32(texture_dims.x);
+    }
+    
     // Sample the auxiliary texture for age data
-    let aux_sample = textureSample(aux_texture, texture_sampler, in.tex_coords);
-    let age_normalized = aux_sample.r; // Age is stored in red channel (0.0-1.0, representing 0-255)
+    let aux_sample = textureSample(aux_texture, texture_sampler, adjusted_tex_coords);
+    let age_normalized = aux_sample.r; // Age is stored in red channel (0.0-1.0)
     
     // Only render if there's age data (meaning there's an empire)
-    if age_normalized < 0.004 { // Less than 1/255 (age 0 or 1)
+    // Age > 0.0 means empire exists (very small threshold for floating point precision)
+    if age_normalized < 0.0001 { // Changed from <= to < to allow 0.001 values through
         return vec4<f32>(0.0, 0.0, 0.0, 0.0); // Transparent for no empire
     }
     

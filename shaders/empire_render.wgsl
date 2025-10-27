@@ -72,8 +72,8 @@ fn get_empire_color(empire_id: f32) -> vec3<f32> {
         return vec3<f32>(0.0, 0.0, 0.0); // Black for unclaimed (transparent anyway)
     }
     
-    // Convert to integer for hashing
-    let id_int = u32(empire_id * 255.0);
+    // Convert to integer for hashing (16-bit range now)
+    let id_int = u32(empire_id * 65535.0);
     let hash_val = hash_empire_id(id_int);
     
     // Generate HSV values from hash

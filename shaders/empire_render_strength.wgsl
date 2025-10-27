@@ -48,7 +48,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let cell_data = textureSample(t_texture, s_texture, adjusted_tex_coords);
     let empire_id = cell_data.r;
-    let strength = cell_data.g;     // Strength value (0.0 to 1.0)
+    let strength = cell_data.g;     // Strength value (0.0 to 1.0, representing 0-65535 in 16-bit)
     
     // Visualize strength as a heatmap
     if (empire_id == 0.0) {
@@ -56,7 +56,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
         // Create a blue-to-red heatmap for strength
-        let heatmap_color = vec3<f32>(strength, 0.0, 1.0 - strength);
+        // Adjust the range to show more detail in typical strength values (0.0-0.3 range)
+        let adjusted_strength = clamp(strength * 3.0, 0.0, 1.0); // Scale up to see more variation
+        let heatmap_color = vec3<f32>(adjusted_strength, 0.0, 1.0 - adjusted_strength);
         return vec4<f32>(heatmap_color, 0.8);
     }
 }

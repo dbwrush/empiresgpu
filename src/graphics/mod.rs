@@ -64,9 +64,15 @@ impl GraphicsContext {
             
         println!("GPU Adapter: {}", adapter.get_info().name);
         
-        // Create device and queue
+        // Create device and queue with 16-bit texture format support
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("GPU Device"),
+                required_features: wgpu::Features::TEXTURE_FORMAT_16BIT_NORM,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
             .await
             .unwrap();
             
