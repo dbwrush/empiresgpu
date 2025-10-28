@@ -1,6 +1,10 @@
 use wgpu::util::DeviceExt;
 use crate::graphics::{GraphicsContext, load_shader};
 use noise::{NoiseFn, Simplex};
+use std::collections::HashMap;
+
+mod diplomacy;
+use diplomacy::DiplomacyState;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RenderMode {
@@ -9,6 +13,7 @@ pub enum RenderMode {
     Need = 2,
     Action = 3,
     Age = 4,
+    Diplomacy = 5,
 }
 
 // Generate terrain data using simplex noise with cylindrical world wrapping
@@ -111,12 +116,21 @@ pub struct EmpireSimulation {
     pub empire_params_texture: wgpu::Texture,  // Read-only per-empire parameters (aggression, diplomacy, etc.)
     pub aux_texture_a: wgpu::Texture,    // Auxiliary data texture A (currently: age tracking, future: other dynamic data)
     pub aux_texture_b: wgpu::Texture,    // Auxiliary data texture B (ping-pong with A)
+    
+    // Diplomacy system buffers (declared before bind groups that use them for proper drop order)
+    diplomacy_counters_buffer: wgpu::Buffer,  // Atomic counters for diplomatic events (256×256×4 u32s)
+    diplomacy_staging_buffer: wgpu::Buffer,   // Staging buffer for reading counter data from GPU
+    diplomacy_relations_buffer: wgpu::Buffer, // Current relations matrix (256×256 f32s)
+    perspective_empire_buffer: wgpu::Buffer,  // Uniform buffer for perspective empire
+    
     pub compute_bind_group_a: wgpu::BindGroup,
     pub compute_bind_group_b: wgpu::BindGroup,
     pub display_bind_group_a: wgpu::BindGroup,
     pub display_bind_group_b: wgpu::BindGroup,
     pub aux_bind_group_a: wgpu::BindGroup,       // Bind group for auxiliary texture A rendering
     pub aux_bind_group_b: wgpu::BindGroup,       // Bind group for auxiliary texture B rendering
+    pub diplomacy_bind_group_a: wgpu::BindGroup,  // Bind group for diplomacy view A
+    pub diplomacy_bind_group_b: wgpu::BindGroup,  // Bind group for diplomacy view B
     pub terrain_bind_group: wgpu::BindGroup,     // For terrain rendering
     pub compute_pipeline: wgpu::ComputePipeline,
     pub render_pipeline_empires: wgpu::RenderPipeline,
@@ -124,6 +138,7 @@ pub struct EmpireSimulation {
     pub render_pipeline_need: wgpu::RenderPipeline,
     pub render_pipeline_action: wgpu::RenderPipeline,
     pub render_pipeline_age: wgpu::RenderPipeline,
+    pub render_pipeline_diplomacy: wgpu::RenderPipeline,
     pub terrain_pipeline: wgpu::RenderPipeline,  // For terrain rendering
     pub current_render_mode: RenderMode,
     pub current_is_a: bool,
@@ -133,6 +148,11 @@ pub struct EmpireSimulation {
     pub game_size: u32,
     pub frame_uniform_buffer: wgpu::Buffer,
     pub num_empires: u16,  // Track number of empires for parameters texture size (16-bit for 65535 empires)
+    pub perspective_empire: u16,  // Which empire to view diplomacy from (0 = none selected)
+    
+    // Diplomacy state
+    diplomacy_state: DiplomacyState,          // CPU-side diplomacy processor
+    diplomacy_pending_map: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>, // Async map receiver
 }
 
 impl EmpireSimulation {
@@ -216,7 +236,8 @@ impl EmpireSimulation {
             format: wgpu::TextureFormat::Rgba16Unorm, // 16-bit for extended range (0-65535)
             usage: wgpu::TextureUsages::TEXTURE_BINDING 
                 | wgpu::TextureUsages::STORAGE_BINDING 
-                | wgpu::TextureUsages::COPY_DST,
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC, // Allow reading back from GPU
             view_formats: &[],
         };
         
@@ -384,6 +405,52 @@ impl EmpireSimulation {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        
+        // Create diplomacy buffers
+        // Counters: 256×256 empire pairs × 4 u32s per pair = 262,144 u32s = 1,048,576 bytes
+        let diplomacy_counters_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Diplomacy Counters Buffer"),
+            size: (256 * 256 * 4 * std::mem::size_of::<u32>()) as u64, // 1 MB
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Staging buffer for reading back counter data from GPU
+        let diplomacy_staging_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Diplomacy Staging Buffer"),
+            size: (256 * 256 * 4 * std::mem::size_of::<u32>()) as u64, // 1 MB
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Relations: 256×256 f32 values = 262,144 bytes
+        let diplomacy_relations_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Diplomacy Relations Buffer"),
+            size: (256 * 256 * std::mem::size_of::<f32>()) as u64, // 256 KB
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Perspective empire for diplomacy view (u32)
+        let perspective_empire_buffer = graphics.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Perspective Empire Buffer"),
+            contents: bytemuck::cast_slice(&[0u32]), // Start with no empire selected
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        
+        // Initialize counters to zero
+        graphics.queue.write_buffer(
+            &diplomacy_counters_buffer,
+            0,
+            bytemuck::cast_slice(&vec![0u32; 256 * 256 * 4]),
+        );
+        
+        // Initialize relations to zero (neutral)
+        graphics.queue.write_buffer(
+            &diplomacy_relations_buffer,
+            0,
+            bytemuck::cast_slice(&vec![0.0f32; 256 * 256]),
+        );
 
         // Create compute bind group layout
         let compute_bind_group_layout = graphics.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -459,6 +526,26 @@ impl EmpireSimulation {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         
@@ -512,6 +599,14 @@ impl EmpireSimulation {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&aux_view_b),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: diplomacy_counters_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: diplomacy_relations_buffer.as_entire_binding(),
+                },
             ],
         });
         
@@ -546,6 +641,14 @@ impl EmpireSimulation {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: wgpu::BindingResource::TextureView(&aux_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: diplomacy_counters_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: diplomacy_relations_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -691,6 +794,145 @@ impl EmpireSimulation {
         let render_pipeline_action = create_render_pipeline("shaders/empire_render_action.wgsl", "Action Render Pipeline");
         let render_pipeline_age = create_render_pipeline("shaders/empire_render_age.wgsl", "Age Render Pipeline");
         
+        // Create diplomacy perspective pipeline (has different bind group layout)
+        let diplomacy_shader = load_shader(&graphics.device, "shaders/empire_render_diplomacy.wgsl");
+        
+        // Diplomacy bind group layout: texture, sampler, relations buffer, perspective uniform
+        let diplomacy_display_layout = graphics.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Diplomacy Display Bind Group Layout"),
+            entries: &[
+                // Binding 0: Texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                // Binding 1: Sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Binding 2: Diplomacy relations buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 3: Perspective empire uniform
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        
+        // Create diplomacy bind groups (for A and B textures)
+        let diplomacy_bind_group_a = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Diplomacy Bind Group A"),
+            layout: &diplomacy_display_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&game_view_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: diplomacy_relations_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: perspective_empire_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        let diplomacy_bind_group_b = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Diplomacy Bind Group B"),
+            layout: &diplomacy_display_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&game_view_b),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&texture_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: diplomacy_relations_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: perspective_empire_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        
+        let render_pipeline_diplomacy = graphics.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Diplomacy Render Pipeline"),
+            layout: Some(&graphics.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Diplomacy Pipeline Layout"),
+                bind_group_layouts: &[&diplomacy_display_layout, camera_bind_group_layout],
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: &diplomacy_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[crate::graphics::Vertex::desc()],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &diplomacy_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: graphics.config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: Some(wgpu::Face::Back),
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+        
         // Create terrain bind group for rendering
         let terrain_bind_group = graphics.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Terrain Bind Group"),
@@ -755,7 +997,7 @@ impl EmpireSimulation {
         
         println!("Empire simulation and terrain pipelines created! Ready to simulate.");
         
-        Self {
+        let sim = Self {
             texture_a,
             texture_b,
             terrain_texture,
@@ -768,6 +1010,8 @@ impl EmpireSimulation {
             display_bind_group_b,
             aux_bind_group_a,
             aux_bind_group_b,
+            diplomacy_bind_group_a,
+            diplomacy_bind_group_b,
             terrain_bind_group,
             compute_pipeline,
             render_pipeline_empires,
@@ -775,6 +1019,7 @@ impl EmpireSimulation {
             render_pipeline_need,
             render_pipeline_action,
             render_pipeline_age,
+            render_pipeline_diplomacy,
             terrain_pipeline,
             current_render_mode: RenderMode::Empires,
             current_is_a: true,
@@ -784,7 +1029,24 @@ impl EmpireSimulation {
             game_size,
             frame_uniform_buffer,
             num_empires: num_spawned_empires,
-        }
+            perspective_empire: 0,
+            diplomacy_counters_buffer,
+            diplomacy_staging_buffer,
+            diplomacy_relations_buffer,
+            perspective_empire_buffer,
+            diplomacy_state: DiplomacyState::new(),
+            diplomacy_pending_map: None,
+        };
+        
+        // Upload initial random relations to GPU
+        let initial_relations = sim.diplomacy_state.to_buffer();
+        graphics.queue.write_buffer(
+            &sim.diplomacy_relations_buffer,
+            0,
+            bytemuck::cast_slice(&initial_relations),
+        );
+        
+        sim
     }
     
     pub fn update(&mut self, graphics: &GraphicsContext) {
@@ -837,6 +1099,77 @@ impl EmpireSimulation {
         }
 
         graphics.queue.submit(std::iter::once(encoder.finish()));
+        
+        // Async diplomacy processing pipeline - runs as fast as possible without blocking
+        // State machine: None → Copy+Request → Poll → Process → None
+        
+        if let Some(rx) = &self.diplomacy_pending_map {
+            // Try to receive without blocking
+            if let Ok(result) = rx.try_recv() {
+                // Mapping completed! Process the data
+                if result.is_ok() {
+                    let staging_slice = self.diplomacy_staging_buffer.slice(..);
+                    let counter_data = staging_slice.get_mapped_range();
+                    let counter_u32s: &[u32] = bytemuck::cast_slice(&counter_data);
+                    
+                    // Count non-zero events for debugging
+                    let total_events: u32 = counter_u32s.iter().sum();
+                    if total_events > 0 && self.frame_count % 300 == 0 {
+                        println!("📊 Diplomacy: Processed {} events at frame {}", total_events, self.frame_count);
+                    }
+                    
+                    // Process counters (TODO: add territory size tracking)
+                    let territory_sizes = std::collections::HashMap::new();
+                    self.diplomacy_state.process_counters(counter_u32s, &territory_sizes);
+                    
+                    drop(counter_data);
+                    self.diplomacy_staging_buffer.unmap();
+                    
+                    // Upload updated relations to GPU
+                    let relations_data = self.diplomacy_state.to_buffer();
+                    graphics.queue.write_buffer(
+                        &self.diplomacy_relations_buffer,
+                        0,
+                        bytemuck::cast_slice(&relations_data),
+                    );
+                }
+                
+                // Clear pending state - ready for next cycle
+                self.diplomacy_pending_map = None;
+            }
+        } else {
+            // No pending map - start a new cycle
+            // Copy counters to staging buffer
+            let mut encoder = graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Diplomacy Copy Encoder"),
+            });
+            encoder.copy_buffer_to_buffer(
+                &self.diplomacy_counters_buffer,
+                0,
+                &self.diplomacy_staging_buffer,
+                0,
+                (256 * 256 * 4 * std::mem::size_of::<u32>()) as u64,
+            );
+            graphics.queue.submit(std::iter::once(encoder.finish()));
+            
+            // Zero out the counters immediately for next batch
+            let zero_counters = vec![0u32; 256 * 256 * 4];
+            graphics.queue.write_buffer(
+                &self.diplomacy_counters_buffer,
+                0,
+                bytemuck::cast_slice(&zero_counters),
+            );
+            
+            // Request async mapping
+            let staging_slice = self.diplomacy_staging_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            staging_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            
+            // Store receiver for next frame
+            self.diplomacy_pending_map = Some(rx);
+        }
         
         // Flip ping-pong state
         self.current_is_a = !self.current_is_a;
@@ -898,7 +1231,7 @@ impl EmpireSimulation {
         println!("Simulation {}", if self.is_paused { "paused" } else { "resumed" });
     }
     
-    pub fn set_render_mode(&mut self, mode: RenderMode) {
+    pub fn set_render_mode(&mut self, mode: RenderMode, graphics: &GraphicsContext) {
         if self.current_render_mode != mode {
             self.current_render_mode = mode;
             let mode_name = match mode {
@@ -907,6 +1240,13 @@ impl EmpireSimulation {
                 RenderMode::Need => "Need Heatmap (green=low, yellow=med, red=high)",
                 RenderMode::Action => "Action Visualization (blue=reinforce, red=attack)",
                 RenderMode::Age => "Age Visualization (red=new, green=old)",
+                RenderMode::Diplomacy => {
+                    // Auto-select empire 1 when entering diplomacy mode if none selected
+                    if self.perspective_empire == 0 {
+                        self.set_perspective_empire(1, graphics);
+                    }
+                    "Diplomacy Perspective (blue=self, gold=allied, green=neutral, red=enemy)"
+                },
             };
             println!("🎨 Switched to render mode: {}", mode_name);
         }
@@ -915,7 +1255,99 @@ impl EmpireSimulation {
     pub fn get_render_mode(&self) -> RenderMode {
         self.current_render_mode
     }
-    
+
+    pub fn set_perspective_empire(&mut self, empire_id: u16, graphics: &GraphicsContext) {
+        self.perspective_empire = empire_id;
+        // Update the GPU buffer with the new perspective empire
+        graphics.queue.write_buffer(
+            &self.perspective_empire_buffer,
+            0,
+            &(empire_id as u32).to_le_bytes(),
+        );
+        
+        if empire_id == 0 {
+            println!("🔭 Cleared diplomacy perspective");
+        } else {
+            println!("🔭 Set diplomacy perspective to Empire {}", empire_id);
+        }
+    }
+
+    pub fn select_perspective_at_cell(&mut self, x: u32, y: u32, graphics: &GraphicsContext) {
+        if x >= self.game_size || y >= self.game_size {
+            return; // Out of bounds
+        }
+        
+        println!("🔍 Reading empire at cell ({}, {})", x, y);
+        
+        // Instead of blocking, just read the current state synchronously with immediate device poll
+        // Create a small staging buffer for one pixel
+        let bytes_per_pixel = 8u64;
+        let staging_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Perspective Selection Staging"),
+            size: bytes_per_pixel,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        let mut encoder = graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Read Empire ID"),
+        });
+        
+        let source_texture = if self.current_is_a { &self.texture_a } else { &self.texture_b };
+        
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: source_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_pixel as u32),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        
+        graphics.queue.submit(Some(encoder.finish()));
+        
+        // Request the buffer mapping
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        
+        // Poll device until callback completes (wgpu 26 requires PollType argument)
+        while receiver.try_recv().is_err() {
+            let _ = graphics.device.poll(wgpu::PollType::Wait);
+        }
+        
+        // At this point the buffer is mapped, read the data
+        let data = buffer_slice.get_mapped_range();
+        if data.len() >= 2 {
+            let empire_id = u16::from_le_bytes([data[0], data[1]]);
+            println!("✅ Read empire ID: {}", empire_id);
+            drop(data);
+            staging_buffer.unmap();
+            
+            if empire_id > 0 {
+                self.set_perspective_empire(empire_id, graphics);
+            } else {
+                println!("🔭 Clicked on unclaimed territory (no empire)");
+            }
+        } else {
+            println!("⚠️  Buffer data too small");
+        }
+    }
 
     
     pub fn render(&self, render_pass: &mut wgpu::RenderPass, vertex_buffer: &wgpu::Buffer, camera_bind_group: &wgpu::BindGroup) {
@@ -933,6 +1365,7 @@ impl EmpireSimulation {
             RenderMode::Need => &self.render_pipeline_need,
             RenderMode::Action => &self.render_pipeline_action,
             RenderMode::Age => &self.render_pipeline_age,
+            RenderMode::Diplomacy => &self.render_pipeline_diplomacy,
         };
         render_pass.set_pipeline(current_pipeline);
         
@@ -947,6 +1380,14 @@ impl EmpireSimulation {
                     &self.aux_bind_group_a // Show A (just written)
                 } else {
                     &self.aux_bind_group_b // Show B (just written)
+                }
+            }
+            RenderMode::Diplomacy => {
+                // Use diplomacy perspective bind groups
+                if self.current_is_a {
+                    &self.diplomacy_bind_group_a
+                } else {
+                    &self.diplomacy_bind_group_b
                 }
             }
             _ => {

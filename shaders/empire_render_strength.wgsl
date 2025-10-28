@@ -56,9 +56,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
         // Create a blue-to-red heatmap for strength
-        // Adjust the range to show more detail in typical strength values (0.0-0.3 range)
-        let adjusted_strength = clamp(strength * 3.0, 0.0, 1.0); // Scale up to see more variation
-        let heatmap_color = vec3<f32>(adjusted_strength, 0.0, 1.0 - adjusted_strength);
+        // Use the strength value directly (already normalized 0.0-1.0)
+        let strength_normalized = clamp(strength, 0.0, 1.0);
+        let heatmap_color = vec3<f32>(strength_normalized, 0.0, 1.0 - strength_normalized);
         return vec4<f32>(heatmap_color, 0.8);
     }
 }

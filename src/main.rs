@@ -208,27 +208,32 @@ impl ApplicationHandler for App {
                                 },
                                 KeyCode::Digit1 => {
                                     if let Some(state) = &mut self.state {
-                                        state.simulation.set_render_mode(RenderMode::Empires);
+                                        state.simulation.set_render_mode(RenderMode::Empires, &state.graphics);
                                     }
                                 },
                                 KeyCode::Digit2 => {
                                     if let Some(state) = &mut self.state {
-                                        state.simulation.set_render_mode(RenderMode::Strength);
+                                        state.simulation.set_render_mode(RenderMode::Strength, &state.graphics);
                                     }
                                 },
                                 KeyCode::Digit3 => {
                                     if let Some(state) = &mut self.state {
-                                        state.simulation.set_render_mode(RenderMode::Need);
+                                        state.simulation.set_render_mode(RenderMode::Need, &state.graphics);
                                     }
                                 },
                                 KeyCode::Digit4 => {
                                     if let Some(state) = &mut self.state {
-                                        state.simulation.set_render_mode(RenderMode::Action);
+                                        state.simulation.set_render_mode(RenderMode::Action, &state.graphics);
                                     }
                                 },
                                 KeyCode::Digit5 => {
                                     if let Some(state) = &mut self.state {
-                                        state.simulation.set_render_mode(RenderMode::Age);
+                                        state.simulation.set_render_mode(RenderMode::Age, &state.graphics);
+                                    }
+                                },
+                                KeyCode::Digit6 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::Diplomacy, &state.graphics);
                                     }
                                 },
                                 _ => {}
@@ -249,21 +254,33 @@ impl ApplicationHandler for App {
                 }
             },
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
-                // Handle left mouse click to claim cell for Empire 1
                 if let Some(state_ref) = &mut self.state {
                     if let Some((cursor_x, cursor_y)) = state_ref.cursor_position {
                         if let Some((game_x, game_y)) = state_ref.camera.screen_to_game_coords(cursor_x, cursor_y, state_ref.graphics.size, state_ref.simulation.game_size as f32) {
-                            state_ref.claim_cell_for_empire(game_x, game_y, 1); // Empire 1
+                            // Check if we're in Diplomacy mode
+                            if state_ref.simulation.current_render_mode == RenderMode::Diplomacy {
+                                // In Diplomacy mode, select the empire at the clicked cell
+                                state_ref.simulation.select_perspective_at_cell(game_x, game_y, &state_ref.graphics);
+                            } else {
+                                // In other modes, claim territory for Empire 1
+                                state_ref.claim_cell_for_empire(game_x, game_y, 1); // Empire 1
+                            }
                         }
                     }
                 }
             },
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
-                // Handle right mouse click to unclaim cell (set to Empire 0)
                 if let Some(state_ref) = &mut self.state {
-                    if let Some((cursor_x, cursor_y)) = state_ref.cursor_position {
-                        if let Some((game_x, game_y)) = state_ref.camera.screen_to_game_coords(cursor_x, cursor_y, state_ref.graphics.size, state_ref.simulation.game_size as f32) {
-                            state_ref.claim_cell_for_empire(game_x, game_y, 0); // Unclaim (Empire 0)
+                    // Check if we're in Diplomacy mode
+                    if state_ref.simulation.current_render_mode == RenderMode::Diplomacy {
+                        // In Diplomacy mode, clear the perspective
+                        state_ref.simulation.set_perspective_empire(0, &state_ref.graphics);
+                    } else {
+                        // In other modes, unclaim territory
+                        if let Some((cursor_x, cursor_y)) = state_ref.cursor_position {
+                            if let Some((game_x, game_y)) = state_ref.camera.screen_to_game_coords(cursor_x, cursor_y, state_ref.graphics.size, state_ref.simulation.game_size as f32) {
+                                state_ref.claim_cell_for_empire(game_x, game_y, 0); // Unclaim (Empire 0)
+                            }
                         }
                     }
                 }
@@ -307,7 +324,8 @@ fn main() {
     println!("  3 - Need heatmap mode");
     println!("  4 - Action visualization mode");
     println!("  5 - Age visualization mode (red=new, green=old)");
-    println!("  Left Click - Claim territory for Empire 1 (unique color)");
+    println!("  6 - Diplomacy perspective mode (shows relations from selected empire's POV)");
+    println!("  Left Click - Select perspective empire in Diplomacy mode (or claim territory in other modes)");
     println!("  Right Click - Unclaim territory");
     println!("  ESC - Exit");
     

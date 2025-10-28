@@ -55,22 +55,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Unclaimed territory - completely transparent
         return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     } else {
-        // Decode action using bit flags (same as compute shader)
-        let action_int = u32(action * 255.0);
-        let action_type = (action_int >> 7u) & 3u; // Extract action type (bits 7-8)
+        // Decode action using NEW 16-bit encoding
+        let action_u16 = u32(action * 65535.0);
+        let amount_12bit = (action_u16 >> 3u) & 4095u; // Extract amount (bits 3-14)
+        let is_reinforce = (action_u16 >> 15u) & 1u; // Extract action type (bit 15)
         
-        if (action_int == 0u) {
+        if (amount_12bit == 0u) {
             // No action - dark gray
             return vec4<f32>(0.2, 0.2, 0.2, 0.6);
-        } else if (action_type == 1u) {
+        } else if (is_reinforce == 0u) {
             // Attack action - red
             return vec4<f32>(1.0, 0.2, 0.0, 0.8);
-        } else if (action_type == 2u) {
+        } else {
             // Reinforce action - blue
             return vec4<f32>(0.0, 0.5, 1.0, 0.8);
-        } else {
-            // Unknown action - purple
-            return vec4<f32>(0.8, 0.2, 0.8, 0.8);
         }
     }
 }

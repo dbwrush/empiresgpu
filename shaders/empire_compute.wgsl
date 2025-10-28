@@ -19,6 +19,21 @@ var aux_input_texture: texture_2d<f32>; // RGBA16Unorm auxiliary input texture (
 @group(0) @binding(6)
 var aux_output_texture: texture_storage_2d<rgba16unorm, write>; // RGBA16Unorm auxiliary output texture
 
+// Diplomacy system: Real-time atomic counters for empire interactions
+// 256x256 matrix, 4 u32 counters per empire pair
+struct DiplomacyCounters {
+    attack_count: atomic<u32>,      // Number of attacks from A to B
+    attack_strength: atomic<u32>,   // Total attack strength (accumulated)
+    reinforce_count: atomic<u32>,   // Number of reinforcements from A to B
+    reinforce_strength: atomic<u32>, // Total reinforce strength (accumulated)
+}
+
+@group(0) @binding(7)
+var<storage, read_write> diplomacy_counters: array<DiplomacyCounters>; // 256*256 = 65536 entries
+
+@group(0) @binding(8)
+var<storage, read> diplomacy_relations: array<f32>; // 256*256 relations matrix (-1.0 to 1.0)
+
 // High-quality pseudorandom number generator using PCG algorithm
 // Returns a pseudorandom u32 based on position and frame
 fn pcg_hash(x: u32, y: u32, frame: u32) -> u32 {
@@ -81,6 +96,51 @@ fn get_empire_params(empire_id: u32) -> vec4<f32> {
     // For aggression, we use the empire's own row (doesn't matter which column)
     let empire_pos = vec2<i32>(0, i32(empire_id - 1u)); // Use first column for aggression
     return textureLoad(empire_params_texture, empire_pos, 0);
+}
+
+// Get diplomatic relation between two empires
+// Returns: -1.0 = hostile/war, 0.0 = neutral, 1.0 = allied
+fn get_diplomacy(empire_a: u32, empire_b: u32) -> f32 {
+    if (empire_a == 0u || empire_b == 0u || empire_a > 255u || empire_b > 255u) {
+        return 0.0; // Neutral for invalid empires
+    }
+    if (empire_a == empire_b) {
+        return 1.0; // Self-relation is always maximum
+    }
+    
+    // Access symmetric matrix (relations are the same both ways)
+    // Use (min, max) ordering to ensure we always access the same cell
+    let a_idx = empire_a - 1u;
+    let b_idx = empire_b - 1u;
+    let row = min(a_idx, b_idx);
+    let col = max(a_idx, b_idx);
+    let idx = row * 256u + col;
+    return diplomacy_relations[idx];
+}
+
+// Record a diplomatic event (attack or reinforcement to another empire)
+fn record_diplomatic_event(actor_empire: u32, target_empire: u32, is_attack: bool, strength: u32) {
+    if (actor_empire == 0u || target_empire == 0u || actor_empire > 255u || target_empire > 255u) {
+        return; // Invalid empires
+    }
+    if (actor_empire == target_empire) {
+        return; // Don't record same-empire events
+    }
+    
+    // Access symmetric matrix using (min, max) ordering
+    let a_idx = actor_empire - 1u;
+    let t_idx = target_empire - 1u;
+    let row = min(a_idx, t_idx);
+    let col = max(a_idx, t_idx);
+    let idx = row * 256u + col;
+    
+    if (is_attack) {
+        atomicAdd(&diplomacy_counters[idx].attack_count, 1u);
+        atomicAdd(&diplomacy_counters[idx].attack_strength, strength);
+    } else {
+        atomicAdd(&diplomacy_counters[idx].reinforce_count, 1u);
+        atomicAdd(&diplomacy_counters[idx].reinforce_strength, strength);
+    }
 }
 
 // Get auxiliary data (age) at position with wrapping - returns normalized float 0.0-1.0
@@ -227,10 +287,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             
             // If neighbor has a valid action targeting this cell
             if (neighbor_empire != 0u && neighbor_action != 0u) {
-                let neighbor_direction = neighbor_action & 7u; // Extract direction (0-5)
-                let action_type = (neighbor_action >> 7u) & 3u; // Extract action type (bits 7-8)
+                let neighbor_direction = neighbor_action & 7u; // Extract direction (bits 0-2)
+                let amount_12bit = (neighbor_action >> 3u) & 4095u; // Extract amount (bits 3-14, 12-bit)
+                let is_reinforce = (neighbor_action >> 15u) & 1u; // Extract action type (bit 15)
                 
-                // Skip invalid directions (6 = no action, 7 = invalid)
+                // Skip if no action (amount = 0)
+                if (amount_12bit == 0u) {
+                    continue;
+                }
+                
+                // Skip invalid directions (6-7)
                 if (neighbor_direction >= 6u) {
                     continue;
                 }
@@ -241,12 +307,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 
                 // If the neighbor is acting on this cell
                 if (neighbor_target.x == pos.x && neighbor_target.y == pos.y) {
-                    if (action_type == 1u) {
-                        // Attack action - use encoded attack strength
+                    // Convert 12-bit amount back to 0.0-1.0 range
+                    let action_amount = f32(amount_12bit) / 4095.0;
+                    
+                    if (is_reinforce == 0u) {
+                        // Attack action
                         if (neighbor_empire != empire_id) {
-                            let attack_strength_bits = (neighbor_action >> 3u) & 15u; // Extract attack strength (bits 3-6)
-                            let attack_strength = f32(attack_strength_bits) / 15.0; // Convert back to 0-1 range
-                            total_attack_strength += attack_strength;
+                            // Apply defender's terrain penalty - attacking into mountains is harder
+                            // Mountains provide strong defensive bonus (quadratic penalty to attacker)
+                            let defender_terrain_penalty = 1.0 - (terrain_penalty * terrain_penalty * 0.8);
+                            let effective_attack = action_amount * defender_terrain_penalty;
+                            
+                            total_attack_strength += effective_attack;
                             
                             // Remember attacking empire (last one wins if multiple)
                             if (!found_attacker) {
@@ -254,11 +326,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                                 found_attacker = true;
                             }
                         }
-                    } else if (action_type == 2u && neighbor_empire == empire_id) {
+                    } else if (is_reinforce == 1u && neighbor_empire == empire_id) {
                         // Reinforcement action from same empire
-                        let transfer_amount_bits = (neighbor_action >> 3u) & 15u; // Extract amount (bits 3-6)
-                        let transfer_amount = f32(transfer_amount_bits) / 15.0; // Convert back to 0-1 range
-                        total_reinforcement_strength += transfer_amount;
+                        // Apply receiver's terrain penalty - reinforcing into mountains is less efficient
+                        let receiver_terrain_penalty = 1.0 - (terrain_penalty * 0.7);
+                        let effective_reinforcement = action_amount * receiver_terrain_penalty;
+                        
+                        total_reinforcement_strength += effective_reinforcement;
                     }
                 }
             }
@@ -369,20 +443,27 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let need_factor = ((-altitude) / (1.0 - ocean_cutoff)) + (1.0 / (1.0 - ocean_cutoff));
             calculated_need *= need_factor;
             
-            // GRADIENT-BASED need propagation for long-range signal transmission
-            // Instead of multiplicative decay, use additive cost (linear gradient)
-            // This allows need signals to travel hundreds or thousands of cells
+                        // GRADIENT-BASED need propagation with AGGRESSIVE terrain penalties
+            // Mountains should severely block need propagation, forcing routes around them
             
             // Distance cost per cell (normalized 0-1 space)
-            // Good terrain: 0.0005-0.001 cost (~1000-2000 cell range)
-            // Bad terrain: 0.002-0.004 cost (~250-500 cell range)
-            let base_distance_cost = 0.0008; // Base cost per hop in good terrain
-            let terrain_cost_multiplier = 1.0 + (terrain_penalty * 3.0); // Mountains cost 4x more
-            let distance_cost = base_distance_cost * terrain_cost_multiplier;
+            // We want mountains to be 50-100x worse than coastal areas
+            let base_distance_cost = 0.002; // Base cost per hop in good terrain (500 cell range)
             
-            // Propagate need as gradient: neighbor_need - distance_cost
-            // This creates a linear decay instead of exponential
-            let propagated_need = max(max_friendly_need - distance_cost, 0.0);
+            // Exponential terrain scaling: mountains should nearly block propagation
+            // terrain_penalty ranges from ~0.05 (ocean/coast) to ~0.95 (mountains)
+            // Use exponential function: 2^(penalty * 6) gives ~1.4x at coast, ~64x at mountains
+            let terrain_exponential = pow(2.0, terrain_penalty * 6.0); // 1.4x to 64x multiplier
+            let distance_cost = base_distance_cost * terrain_exponential;
+            
+            // For extreme mountains (penalty > 0.8), add multiplicative decay as well
+            var propagated_need = max(max_friendly_need - distance_cost, 0.0);
+            if (terrain_penalty > 0.8) {
+                // Severe terrain: combine linear decay with multiplicative decay
+                let multiplicative_decay = 1.0 - (terrain_penalty * 0.5); // 60% to 10% retention
+                propagated_need = propagated_need * multiplicative_decay;
+            }
+            
             calculated_need = calculated_need + propagated_need;
             
             // Update need value (16-bit range now)
@@ -439,29 +520,70 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let terrain_attack_penalty = 1.0 + (terrain_penalty * terrain_penalty * 4.0); // Reduced from 7.0
                 let final_attack_ratio = attack_ratio_requirement * terrain_attack_penalty;
                 
-                // Check if we want to attack the weakest enemy based on aggression tolerance
+                // DECISION TREE: Attack vs Reinforce
+                // Priority 1: Attack if we have an enemy AND enough strength
+                // Priority 2: Reinforce if we can't/won't attack
+                
+                var should_attack = false;
+                var attack_strength = 0.0;
+                
+                // Check if we can attack the weakest enemy
                 if (min_enemy_direction < 6u) {
-                    let ideal_attack_strength = min_enemy_strength * final_attack_ratio;
+                    // Check diplomatic relations with target
+                    let target_offset = get_hex_neighbor_offset(min_enemy_direction, pos.y);
+                    let target_pos = pos + target_offset;
+                    let target_cell = get_cell(target_pos);
+                    let target_empire = float_to_u16(target_cell.r);
                     
-                    // Determine actual attack strength based on what we have available
-                    let actual_attack_strength = min(available_for_action, ideal_attack_strength);
-                    
-                    // Attack if we have at least some meaningful strength to commit
-                    if (actual_attack_strength > 0.02) { // Very low threshold for aggressive empires
-                        // Encode actual attack strength as 4-bit value (0-15)  
-                        let scaled_attack_strength = u32(clamp(actual_attack_strength * 15.0, 1.0, 15.0));
-                        new_action = min_enemy_direction | (1u << 7u) | (scaled_attack_strength << 3u);
-                    } else {
-                        // Not enough strength to mount any attack
-                        new_action = 6u; // No action
+                    var diplomacy_attack_modifier = 1.0;
+                    var allow_attack = true;
+                    if (target_empire != 0u && target_empire != new_empire_id) {
+                        let relation = get_diplomacy(new_empire_id, target_empire);
+                        // relation: -1.0 (hostile) to 1.0 (allied)
+                        
+                        // Don't attack allies (relation > 0.3)
+                        // Use >= -0.3 to include neutral relations (-0.3 to 0.3)
+                        if (relation >= -0.3) {
+                            allow_attack = false;
+                        }
+                        
+                        // For hostile relations, modify attack strength
+                        // Hostile relations (<-0.3): Encourage attacking (lower threshold)
+                        // Formula: hostile reduces requirement
+                        diplomacy_attack_modifier = 1.0 - (relation * 0.7); // Range: 0.3 (hostile) to 1.7 (allied)
                     }
-                } else {
-                    // No enemies to attack, consider reinforcement
-                    new_action = 6u; // No action initially
+                    
+                    let ideal_attack_strength = min_enemy_strength * final_attack_ratio * diplomacy_attack_modifier;
+                    attack_strength = min(available_for_action, ideal_attack_strength);
+                    
+                    // Attack if we have meaningful strength AND it meets threshold AND diplomacy allows
+                    let min_attack_threshold = 1.0 / 4095.0; // Minimum representable attack
+                    
+                    // ALSO: Always attack if enemy is extremely weak (near-dead cells)
+                    // This prevents frozen frontlines with weak remnant cells
+                    if (allow_attack && (attack_strength > min_attack_threshold || min_enemy_strength < 0.01)) {
+                        should_attack = true;
+                    }
                 }
                 
-                // If no safe attack was possible, consider reinforcement 
-                if (new_action == 6u && max_need_direction < 6u && max_friendly_need > (f32(need) / 65535.0)) {
+                if (should_attack) {
+                    // Launch attack
+                    let amount_12bit = u32(clamp(max(attack_strength, 1.0 / 4095.0) * 4095.0, 1.0, 4095.0));
+                    new_action = min_enemy_direction | (amount_12bit << 3u); // Bit 15 = 0 for attack
+                    current_strength_f -= max(attack_strength, 1.0 / 4095.0);
+                    
+                    // Record diplomatic event: We're attacking an enemy
+                    // Get target empire ID
+                    let target_offset = get_hex_neighbor_offset(min_enemy_direction, pos.y);
+                    let target_pos = pos + target_offset;
+                    let target_cell = get_cell(target_pos);
+                    let target_empire = float_to_u16(target_cell.r);
+                    if (target_empire != 0u && target_empire != new_empire_id) {
+                        record_diplomatic_event(new_empire_id, target_empire, true, amount_12bit);
+                    }
+                } else if (max_need_direction < 6u && max_friendly_need > (f32(need) / 65535.0)) {
+                    // No valid attack - reinforce instead
+
                     let my_need = f32(need) / 65535.0;
                     
                     // With gradient-based propagation, adjacent cells have very similar needs
@@ -471,34 +593,73 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     // Only reinforce if neighbor has ANY higher need (gradient flows uphill)
                     // This works because our gradient decay is very gentle (0.0008 per hop)
                     if (need_difference > 0.0001) { // Tiny threshold to avoid floating point errors
-                        // Calculate safe transfer amount that won't compromise our defense
-                        let base_transfer_rate = 0.2; // Conservative transfer rate
-                        let need_factor = 1.0 - (my_need * 0.8); // Keep more if we also have high need
+                        // Check if we're reinforcing an ally (different empire)
+                        let reinforce_offset = get_hex_neighbor_offset(max_need_direction, pos.y);
+                        let reinforce_pos = pos + reinforce_offset;
+                        let reinforce_cell = get_cell(reinforce_pos);
+                        let reinforce_empire = float_to_u16(reinforce_cell.r);
                         
-                        // Terrain penalty for reinforcement efficiency
-                        let transfer_efficiency = 1.0 - (terrain_penalty * 0.95);
+                        var cross_empire_penalty = 1.0;
+                        var allow_cross_empire = false;
                         
-                        let safe_transfer_rate = base_transfer_rate * need_factor * transfer_efficiency;
-                        let proposed_transfer = available_for_action * clamp(safe_transfer_rate, 0.05, 0.4);
+                        if (reinforce_empire != 0u && reinforce_empire != new_empire_id) {
+                            // Different empire - check diplomacy
+                            let relation = get_diplomacy(new_empire_id, reinforce_empire);
+                            // Only allow cross-empire reinforcement if allied (relation > 0.3)
+                            if (relation > 0.3) {
+                                allow_cross_empire = true;
+                                // Allied reinforcements are less efficient (resources lost in transfer)
+                                cross_empire_penalty = 0.3 + (relation * 0.4); // 30% to 70% efficiency
+                            }
+                        } else if (reinforce_empire == new_empire_id || reinforce_empire == 0u) {
+                            // Same empire or unclaimed - always allow
+                            allow_cross_empire = true;
+                            cross_empire_penalty = 1.0; // Full efficiency
+                        }
                         
-                        // Verify transfer won't compromise defense
-                        if (current_strength_f - proposed_transfer >= total_required_defense) {
-                            // Safe to reinforce
-                            let scaled_transfer = u32(clamp(proposed_transfer * 15.0, 1.0, 15.0));
-                            new_action = max_need_direction | (2u << 7u) | (scaled_transfer << 3u);
-                            current_strength_f -= proposed_transfer;
+                        if (allow_cross_empire) {
+                            // Calculate safe transfer amount that won't compromise our defense
+                            let base_transfer_rate = 0.2; // Conservative transfer rate
+                            let need_factor = 1.0 - (my_need * 0.8); // Keep more if we also have high need
+                            
+                            // Terrain penalty for reinforcement efficiency
+                            let transfer_efficiency = 1.0 - (terrain_penalty * 0.95);
+                            
+                            let safe_transfer_rate = base_transfer_rate * need_factor * transfer_efficiency * cross_empire_penalty;
+                            let proposed_transfer = available_for_action * clamp(safe_transfer_rate, 0.05, 0.4);
+                            
+                            // Verify transfer won't compromise defense
+                            if (current_strength_f - proposed_transfer >= total_required_defense) {
+                                // Safe to reinforce
+                                // NEW 16-bit encoding:
+                                // Bits 0-2: direction (0-5)
+                                // Bits 3-14: amount (0-4095, 12 bits)
+                                // Bit 15: action type (0=attack, 1=reinforce)
+                                
+                                let amount_12bit = u32(clamp(proposed_transfer * 4095.0, 1.0, 4095.0));
+                                new_action = max_need_direction | (amount_12bit << 3u) | (1u << 15u); // Bit 15 = 1 for reinforce
+                                current_strength_f -= proposed_transfer;
+                                
+                                // Record diplomatic event if reinforcing another empire
+                                if (reinforce_empire != 0u && reinforce_empire != new_empire_id) {
+                                    record_diplomatic_event(new_empire_id, reinforce_empire, false, amount_12bit);
+                                }
+                            } else {
+                                // Not safe to reinforce
+                                new_action = 0u; // No action
+                            }
                         } else {
-                            // Not safe to reinforce
-                            new_action = 6u; // No action
+                            // Not allowed to reinforce this empire (not allied)
+                            new_action = 0u;
                         }
                     } else {
                         // Need difference not significant enough
-                        new_action = 6u; // No action
+                        new_action = 0u; // No action
                     }
                 }
             } else {
                 // Not enough available strength for any action
-                new_action = 6u; // No action (invalid direction indicates no action)
+                new_action = 0u; // No action
             }
             
             // Update final strength
