@@ -118,9 +118,9 @@ pub struct EmpireSimulation {
     pub aux_texture_b: wgpu::Texture,    // Auxiliary data texture B (ping-pong with A)
     
     // Diplomacy system buffers (declared before bind groups that use them for proper drop order)
-    diplomacy_counters_buffer: wgpu::Buffer,  // Atomic counters for diplomatic events (256×256×4 u32s)
+    diplomacy_counters_buffer: wgpu::Buffer,  // Atomic counters for diplomatic events (2048×2048×5 u32s)
     diplomacy_staging_buffer: wgpu::Buffer,   // Staging buffer for reading counter data from GPU
-    diplomacy_relations_buffer: wgpu::Buffer, // Current relations matrix (256×256 f32s)
+    diplomacy_relations_buffer: wgpu::Buffer, // Current relations matrix (2048×2048 f32s)
     perspective_empire_buffer: wgpu::Buffer,  // Uniform buffer for perspective empire
     
     pub compute_bind_group_a: wgpu::BindGroup,
@@ -150,9 +150,22 @@ pub struct EmpireSimulation {
     pub num_empires: u16,  // Track number of empires for parameters texture size (16-bit for 65535 empires)
     pub perspective_empire: u16,  // Which empire to view diplomacy from (0 = none selected)
     
+    // Empire personality traits (stored CPU-side for quick access)
+    empire_personalities: std::collections::HashMap<u16, EmpirePersonality>,
+    // Cached personality difference matrix (2048×2048 normalized differences, computed once)
+    personality_diff_cache: Vec<f32>,
+    
     // Diplomacy state
     diplomacy_state: DiplomacyState,          // CPU-side diplomacy processor
     diplomacy_pending_map: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>, // Async map receiver
+}
+
+/// Empire personality traits (0-255 for each)
+#[derive(Debug, Clone, Copy)]
+struct EmpirePersonality {
+    aggression: u8,   // 0=peaceful, 255=warlike
+    expansion: u8,    // 0=defensive/isolationist, 255=expansionist/colonial
+    cooperation: u8,  // 0=selfish/competitive, 255=cooperative/altruistic
 }
 
 impl EmpireSimulation {
@@ -280,14 +293,22 @@ impl EmpireSimulation {
         
         // Create empire parameters texture (NxN where N is number of empires)
         // Each pixel contains parameters for one empire vs all empires
-        // For now we'll use a reasonable maximum of 256 empires
-        let max_empires = 256u32;
+        // Maximum of 2048 empires supported for diplomacy and personality systems
+        let max_empires = 2048u32;
         let num_spawned_empires = (empire_id_counter - 1) as u16;
+        
+        // Hard limit check - program cannot run with more empires than diplomacy system supports
+        if num_spawned_empires > max_empires as u16 {
+            panic!("❌ CRITICAL: {} empires spawned, but diplomacy system only supports {}. Reduce empire count or increase MAX_EMPIRES.", 
+                   num_spawned_empires, max_empires);
+        }
         
         println!("Creating empire parameters texture ({}x{}) for {} empires...", max_empires, max_empires, num_spawned_empires);
         
         // Generate empire parameters data
-        // Channel layout: R=diplomacy (opinion of other empire, 0-255), G=aggression (0-255), B=reserved, A=reserved
+        // Channel layout: R=diplomacy (opinion of other empire, 0-255), G=aggression (0-255), 
+        // B=expansion (0=defensive/isolationist, 255=expansionist/colonial), 
+        // A=cooperation (0=selfish/competitive, 255=cooperative/altruistic)
         let mut empire_params_data = Vec::with_capacity((max_empires * max_empires * 4) as usize);
         
         // Initialize the parameters texture
@@ -296,7 +317,7 @@ impl EmpireSimulation {
                 let empire_id = (y + 1) as u16; // Empire IDs start from 1 (16-bit now)
                 let target_empire_id = (x + 1) as u16;
                 
-                let (diplomacy, aggression) = if empire_id <= num_spawned_empires {
+                let (diplomacy, aggression, expansion, cooperation) = if empire_id <= num_spawned_empires {
                     // Generate random diplomacy opinion for this empire vs target empire
                     let mut hasher = DefaultHasher::new();
                     (empire_id, target_empire_id, 54321u32).hash(&mut hasher); // Seed for consistency
@@ -307,18 +328,50 @@ impl EmpireSimulation {
                     (empire_id, 98765u32).hash(&mut hasher2);
                     let aggression_random = (hasher2.finish() % 256) as u8;
                     
-                    (diplomacy_random, aggression_random)
+                    // Generate random expansion trait (0=defensive, 255=expansionist)
+                    let mut hasher3 = DefaultHasher::new();
+                    (empire_id, 13579u32).hash(&mut hasher3);
+                    let expansion_random = (hasher3.finish() % 256) as u8;
+                    
+                    // Generate random cooperation trait (0=selfish, 255=cooperative)
+                    let mut hasher4 = DefaultHasher::new();
+                    (empire_id, 24680u32).hash(&mut hasher4);
+                    let cooperation_random = (hasher4.finish() % 256) as u8;
+                    
+                    (diplomacy_random, aggression_random, expansion_random, cooperation_random)
                 } else {
-                    (128u8, 128u8) // Neutral values for unused empire slots
+                    (128u8, 128u8, 128u8, 128u8) // Neutral values for unused empire slots
                 };
                 
                 empire_params_data.extend_from_slice(&[
-                    diplomacy,  // R: Diplomacy/opinion (not used yet, but ready for future)
-                    aggression, // G: Aggression level (affects combat threshold)
-                    0u8,        // B: Reserved for future parameters
-                    255u8,      // A: Full alpha
+                    diplomacy,    // R: Diplomacy/opinion (not used yet, but ready for future)
+                    aggression,   // G: Aggression level (affects combat threshold)
+                    expansion,    // B: Expansion drive (0=defensive, 255=expansionist)
+                    cooperation,  // A: Cooperation level (0=selfish, 255=cooperative)
                 ]);
             }
+        }
+        
+        // Build empire personalities HashMap for CPU-side access
+        let mut empire_personalities = std::collections::HashMap::new();
+        for empire_id in 1..=num_spawned_empires {
+            // Extract personality from the same data we generated
+            // The texture is organized as: for each row (empire), there are max_empires columns (targets)
+            // Row index = empire_id - 1, and we can use any column (traits are same for all columns)
+            // We'll use column 0 for simplicity
+            let row = (empire_id - 1) as usize;
+            let col = 0usize;
+            let idx = (row * (max_empires as usize) + col) * 4; // 4 bytes per pixel (RGBA)
+            
+            let aggression = empire_params_data[idx + 1];   // G channel
+            let expansion = empire_params_data[idx + 2];    // B channel
+            let cooperation = empire_params_data[idx + 3];  // A channel
+            
+            empire_personalities.insert(empire_id, EmpirePersonality {
+                aggression,
+                expansion,
+                cooperation,
+            });
         }
         
         let empire_params_texture_desc = wgpu::TextureDescriptor {
@@ -407,10 +460,10 @@ impl EmpireSimulation {
         });
         
         // Create diplomacy buffers
-        // Counters: 256×256 empire pairs × 4 u32s per pair = 262,144 u32s = 1,048,576 bytes
+        // Counters: 2048×2048 empire pairs × 5 u32s per pair = 20,971,520 u32s = 83,886,080 bytes (~80 MB)
         let diplomacy_counters_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Diplomacy Counters Buffer"),
-            size: (256 * 256 * 4 * std::mem::size_of::<u32>()) as u64, // 1 MB
+            size: (2048 * 2048 * 5 * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -418,15 +471,15 @@ impl EmpireSimulation {
         // Staging buffer for reading back counter data from GPU
         let diplomacy_staging_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Diplomacy Staging Buffer"),
-            size: (256 * 256 * 4 * std::mem::size_of::<u32>()) as u64, // 1 MB
+            size: (2048 * 2048 * 5 * std::mem::size_of::<u32>()) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         
-        // Relations: 256×256 f32 values = 262,144 bytes
+        // Relations: 2048×2048 f32 values = 16,777,216 bytes (~16 MB)
         let diplomacy_relations_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Diplomacy Relations Buffer"),
-            size: (256 * 256 * std::mem::size_of::<f32>()) as u64, // 256 KB
+            size: (2048 * 2048 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -442,14 +495,14 @@ impl EmpireSimulation {
         graphics.queue.write_buffer(
             &diplomacy_counters_buffer,
             0,
-            bytemuck::cast_slice(&vec![0u32; 256 * 256 * 4]),
+            bytemuck::cast_slice(&vec![0u32; 2048 * 2048 * 5]),
         );
         
         // Initialize relations to zero (neutral)
         graphics.queue.write_buffer(
             &diplomacy_relations_buffer,
             0,
-            bytemuck::cast_slice(&vec![0.0f32; 256 * 256]),
+            bytemuck::cast_slice(&vec![0.0f32; 2048 * 2048]),
         );
 
         // Create compute bind group layout
@@ -997,7 +1050,7 @@ impl EmpireSimulation {
         
         println!("Empire simulation and terrain pipelines created! Ready to simulate.");
         
-        let sim = Self {
+        let mut sim = Self {
             texture_a,
             texture_b,
             terrain_texture,
@@ -1030,6 +1083,8 @@ impl EmpireSimulation {
             frame_uniform_buffer,
             num_empires: num_spawned_empires,
             perspective_empire: 0,
+            empire_personalities,
+            personality_diff_cache: vec![0.5f32; 2048 * 2048], // Will be computed after initialization
             diplomacy_counters_buffer,
             diplomacy_staging_buffer,
             diplomacy_relations_buffer,
@@ -1037,6 +1092,28 @@ impl EmpireSimulation {
             diplomacy_state: DiplomacyState::new(),
             diplomacy_pending_map: None,
         };
+        
+        // Pre-compute personality difference cache (static for the entire game)
+        // Use Euclidean distance instead of average to make differences more pronounced
+        // This way empires need to be similar on ALL axes to be compatible
+        for (&a, pa) in &sim.empire_personalities {
+            if a > 2047 { continue; }
+            for (&b, pb) in &sim.empire_personalities {
+                if b > 2047 { continue; }
+                let aggression_diff = (pa.aggression as i16 - pb.aggression as i16).abs() as f32;
+                let expansion_diff = (pa.expansion as i16 - pb.expansion as i16).abs() as f32;
+                let cooperation_diff = (pa.cooperation as i16 - pb.cooperation as i16).abs() as f32;
+                
+                // Euclidean distance: sqrt(a² + b² + c²)
+                // Normalized by sqrt(3 * 255²) = ~441.67 (max possible distance)
+                let euclidean_dist = (aggression_diff.powi(2) + expansion_diff.powi(2) + cooperation_diff.powi(2)).sqrt();
+                let max_distance = (3.0_f32 * 255.0_f32.powi(2)).sqrt(); // ~441.67
+                let normalized = euclidean_dist / max_distance;
+                
+                let idx = (a as usize) * 2048 + (b as usize);
+                sim.personality_diff_cache[idx] = normalized;
+            }
+        }
         
         // Upload initial random relations to GPU
         let initial_relations = sim.diplomacy_state.to_buffer();
@@ -1118,9 +1195,24 @@ impl EmpireSimulation {
                         println!("📊 Diplomacy: Processed {} events at frame {}", total_events, self.frame_count);
                     }
                     
-                    // Process counters (TODO: add territory size tracking)
+                    // Process counters with personality-based modifiers (using pre-computed cache)
+                    let personality_diffs = &self.personality_diff_cache;
                     let territory_sizes = std::collections::HashMap::new();
-                    self.diplomacy_state.process_counters(counter_u32s, &territory_sizes);
+                    self.diplomacy_state.process_counters(
+                        counter_u32s, 
+                        &territory_sizes,
+                        |a, b| {
+                            let idx = (a as usize) * 2048 + (b as usize);
+                            personality_diffs.get(idx).copied().unwrap_or(0.5)
+                        },
+                    );
+                    
+                    // Propagate attack reactions to third parties
+                    // "You attacked my friend/enemy" effects
+                    self.diplomacy_state.propagate_attack_reactions(counter_u32s, |a, b| {
+                        let idx = (a as usize) * 2048 + (b as usize);
+                        personality_diffs.get(idx).copied().unwrap_or(0.5)
+                    });
                     
                     drop(counter_data);
                     self.diplomacy_staging_buffer.unmap();
@@ -1404,5 +1496,24 @@ impl EmpireSimulation {
         render_pass.set_bind_group(1, camera_bind_group, &[]);
         render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         render_pass.draw(0..6, 0..1);
+    }
+    
+    /// Calculate personality difference between two empires (0.0 = identical, 1.0 = maximally different)
+    /// Returns None if either empire doesn't exist
+    pub fn get_personality_difference(&self, empire_a: u16, empire_b: u16) -> Option<f32> {
+        let personality_a = self.empire_personalities.get(&empire_a)?;
+        let personality_b = self.empire_personalities.get(&empire_b)?;
+        
+        // Calculate absolute differences for each trait (0-255 range)
+        let aggression_diff = (personality_a.aggression as i16 - personality_b.aggression as i16).abs() as f32;
+        let expansion_diff = (personality_a.expansion as i16 - personality_b.expansion as i16).abs() as f32;
+        let cooperation_diff = (personality_a.cooperation as i16 - personality_b.cooperation as i16).abs() as f32;
+        
+        // Average the differences and normalize to 0.0-1.0 range
+        // Maximum difference per trait is 255, so max total is 255
+        let avg_diff = (aggression_diff + expansion_diff + cooperation_diff) / 3.0;
+        let normalized = avg_diff / 255.0;
+        
+        Some(normalized)
     }
 }

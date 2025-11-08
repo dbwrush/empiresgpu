@@ -257,32 +257,22 @@ impl ApplicationHandler for App {
                 if let Some(state_ref) = &mut self.state {
                     if let Some((cursor_x, cursor_y)) = state_ref.cursor_position {
                         if let Some((game_x, game_y)) = state_ref.camera.screen_to_game_coords(cursor_x, cursor_y, state_ref.graphics.size, state_ref.simulation.game_size as f32) {
-                            // Check if we're in Diplomacy mode
+                            // In Diplomacy mode, select the empire at the clicked cell
                             if state_ref.simulation.current_render_mode == RenderMode::Diplomacy {
-                                // In Diplomacy mode, select the empire at the clicked cell
                                 state_ref.simulation.select_perspective_at_cell(game_x, game_y, &state_ref.graphics);
-                            } else {
-                                // In other modes, claim territory for Empire 1
-                                state_ref.claim_cell_for_empire(game_x, game_y, 1); // Empire 1
                             }
+                            // Note: Territory claiming debug feature removed
                         }
                     }
                 }
             },
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
                 if let Some(state_ref) = &mut self.state {
-                    // Check if we're in Diplomacy mode
+                    // In Diplomacy mode, clear the perspective
                     if state_ref.simulation.current_render_mode == RenderMode::Diplomacy {
-                        // In Diplomacy mode, clear the perspective
                         state_ref.simulation.set_perspective_empire(0, &state_ref.graphics);
-                    } else {
-                        // In other modes, unclaim territory
-                        if let Some((cursor_x, cursor_y)) = state_ref.cursor_position {
-                            if let Some((game_x, game_y)) = state_ref.camera.screen_to_game_coords(cursor_x, cursor_y, state_ref.graphics.size, state_ref.simulation.game_size as f32) {
-                                state_ref.claim_cell_for_empire(game_x, game_y, 0); // Unclaim (Empire 0)
-                            }
-                        }
                     }
+                    // Note: Territory unclaiming debug feature removed
                 }
             },
             WindowEvent::Resized(physical_size) => {
