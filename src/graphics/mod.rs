@@ -166,7 +166,9 @@ pub fn load_shader(device: &wgpu::Device, path: &str) -> wgpu::ShaderModule {
         "shaders/empire_render_action.wgsl" => include_str!("../../shaders/empire_render_action.wgsl"),
         "shaders/empire_render_age.wgsl" => include_str!("../../shaders/empire_render_age.wgsl"),
         "shaders/empire_render_diplomacy.wgsl" => include_str!("../../shaders/empire_render_diplomacy.wgsl"),
+        "shaders/empire_render_boat_need.wgsl" => include_str!("../../shaders/empire_render_boat_need.wgsl"),
         "shaders/terrain_render.wgsl" => include_str!("../../shaders/terrain_render.wgsl"),
+        "shaders/boat_render.wgsl" => include_str!("../../shaders/boat_render.wgsl"),
         _ => panic!("Unknown shader path: {}", path),
     };
     

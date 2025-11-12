@@ -20,7 +20,7 @@ var aux_input_texture: texture_2d<f32>; // RGBA16Unorm auxiliary input texture (
 var aux_output_texture: texture_storage_2d<rgba16unorm, write>; // RGBA16Unorm auxiliary output texture
 
 // Diplomacy system: Real-time atomic counters for empire interactions
-// 256x256 matrix, 5 u32 counters per empire pair
+// 2048x2048 matrix, 5 u32 counters per empire pair
 struct DiplomacyCounters {
     attack_count: atomic<u32>,      // Number of attacks from A to B
     attack_strength: atomic<u32>,   // Total attack strength (accumulated)
@@ -30,10 +30,16 @@ struct DiplomacyCounters {
 }
 
 @group(0) @binding(7)
-var<storage, read_write> diplomacy_counters: array<DiplomacyCounters>; // 256*256 = 65536 entries
+var<storage, read_write> diplomacy_counters: array<DiplomacyCounters>; // 2048*2048 = 4194304 entries
 
 @group(0) @binding(8)
-var<storage, read> diplomacy_relations: array<f32>; // 256*256 relations matrix (-1.0 to 1.0)
+var<storage, read> diplomacy_relations: array<f32>; // 2048*2048 relations matrix (-1.0 to 1.0)
+
+@group(0) @binding(9)
+var<storage, read> boat_landings: array<u32>; // Boat attack buffer: upper 16 bits = empire_id, lower 16 bits = strength
+
+@group(0) @binding(10)
+var<storage, read_write> boat_spawns: array<atomic<u32>>; // Boat spawn buffer: upper 16 bits = empire_id, lower 16 bits = direction
 
 // High-quality pseudorandom number generator using PCG algorithm
 // Returns a pseudorandom u32 based on position and frame
@@ -154,46 +160,20 @@ fn record_diplomatic_event(actor_empire: u32, target_empire: u32, is_attack: boo
     }
 }
 
-// Record border pressure when a cell is significantly stronger than a neighbor
-// Only called from the STRONGER cell to reduce redundant reports
-fn record_border_pressure(stronger_empire: u32, weaker_empire: u32, sample_rate: f32, random_seed: u32) {
-    if (stronger_empire == 0u || weaker_empire == 0u || stronger_empire > 2047u || weaker_empire > 2047u) {
-        return;
-    }
-    if (stronger_empire == weaker_empire) {
-        return;
-    }
-    
-    // Probabilistic sampling for expected border pressure
-    if (sample_rate < 1.0) {
-        let sample_threshold = u32(sample_rate * 100.0);
-        let random_value = rng_range(stronger_empire, weaker_empire, random_seed, 1u, 100u);
-        if (random_value >= sample_threshold) {
-            return; // Skip this event
-        }
-    }
-    
-    // Access symmetric matrix
-    let s_idx = stronger_empire - 1u;
-    let w_idx = weaker_empire - 1u;
-    let row = min(s_idx, w_idx);
-    let col = max(s_idx, w_idx);
-    let idx = row * 2048u + col;
-    
-    // Use attack_count to accumulate border pressure events
-    // We'll process these differently on the CPU side based on count vs strength ratio
-    atomicAdd(&diplomacy_counters[idx].pressure_count, 1u);
-}
-
-// Get auxiliary data (age) at position with wrapping - returns normalized float 0.0-1.0
-fn get_aux_data(pos: vec2<i32>) -> f32 {
+// Get auxiliary data (age, boat_need) at position with wrapping - returns vec2<f32>
+fn get_aux_data_full(pos: vec2<i32>) -> vec2<f32> {
     let dims = textureDimensions(aux_input_texture);
     let wrapped_pos = vec2<i32>(
         (pos.x + i32(dims.x)) % i32(dims.x),
         (pos.y + i32(dims.y)) % i32(dims.y)
     );
     let aux_data = textureLoad(aux_input_texture, wrapped_pos, 0);
-    return aux_data.r; // Age is stored in red channel as normalized float (0.0-1.0)
+    return vec2<f32>(aux_data.r, aux_data.g); // age in red, boat_need in green
+}
+
+// Get auxiliary data (age) at position with wrapping - returns normalized float 0.0-1.0
+fn get_aux_data(pos: vec2<i32>) -> f32 {
+    return get_aux_data_full(pos).x;
 }
 
 // Convert float [0,1] to u16 [0,65535]
@@ -271,8 +251,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let need = float_to_u16(current_cell.b);
     let action = float_to_u16(current_cell.a);
     
-    // Read current age data
-    let current_age = get_aux_data(pos);
+    // Read current auxiliary data (age and boat need)
+    let aux_data = get_aux_data_full(pos);
+    let current_age = aux_data.x;
+    var boat_need = aux_data.y; // 0.0 to 1.0, represents desire to send boats
     
     // Read terrain data (for AI decisions and water detection)
     let terrain = get_terrain(pos);
@@ -370,11 +352,84 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         }
                     } else if (is_reinforce == 1u && neighbor_empire == empire_id) {
                         // Reinforcement action from same empire
-                        // Apply receiver's terrain penalty - reinforcing into mountains is less efficient
-                        let receiver_terrain_penalty = 1.0 - (terrain_penalty * 0.7);
+                        // Apply receiver's terrain penalty - but much reduced to boost reinforcement efficiency
+                        let receiver_terrain_penalty = 1.0 - (terrain_penalty * 0.1);  // Reduced from 0.7
                         let effective_reinforcement = action_amount * receiver_terrain_penalty;
                         
                         total_reinforcement_strength += effective_reinforcement;
+                    }
+                }
+            }
+        }
+        
+        // BOAT LANDINGS: Check if any boats are landing at this cell
+        let cell_index = u32(pos.y) * dims.x + u32(pos.x);
+        let boat_landing = boat_landings[cell_index];
+        if (boat_landing != 0u) {
+            let boat_empire = (boat_landing >> 16u) & 0xFFFFu;  // Upper 16 bits
+            let boat_strength_u16 = boat_landing & 0xFFFFu;      // Lower 16 bits
+            let boat_strength_f = f32(boat_strength_u16) / 65535.0;
+            
+            if (boat_empire != 0u) {
+                // Determine action based on empire relationships
+                let relation = get_diplomacy(boat_empire, empire_id);
+                var is_attack = false;
+                var should_act = true;
+                
+                if (empire_id == 0u) {
+                    // Unclaimed territory - always conquer
+                    is_attack = true;
+                } else if (boat_empire == empire_id) {
+                    // Same empire - always reinforce
+                    is_attack = false;
+                } else if (relation >= 0.3) {
+                    // Allied territory (relation >= 0.3) - reinforce
+                    is_attack = false;
+                } else if (relation <= -0.3) {
+                    // Enemy territory (relation <= -0.3) - attack
+                    is_attack = true;
+                } else {
+                    // Neutral territory (-0.3 < relation < 0.3)
+                    // Decision based on boat empire's aggression
+                    let boat_params = get_empire_params(boat_empire);
+                    let aggression = boat_params.r; // Red channel = aggression
+                    
+                    // Random roll against aggression threshold
+                    let roll = rng_range(boat_empire, empire_id, frame_data, 12345u, 100u);
+                    let aggression_threshold = u32(aggression * 100.0);
+                    is_attack = roll < aggression_threshold;
+                }
+                
+                if (is_attack) {
+                    // ATTACK: Apply defender's terrain penalty to boat attack
+                    let defender_terrain_penalty = 1.0 - (terrain_penalty * terrain_penalty * 0.8);
+                    let effective_boat_attack = boat_strength_f * defender_terrain_penalty;
+                    
+                    total_attack_strength += effective_boat_attack;
+                    
+                    // Boat empire becomes potential attacker
+                    if (!found_attacker) {
+                        attacking_empire = boat_empire;
+                        found_attacker = true;
+                    }
+                    
+                    // BOAT NEED TRACKING: Cell is being attacked by boat - increase boat need
+                    // This signals that ocean routes are active and cells should respond with their own boats
+                    if (empire_id != 0u && empire_id != boat_empire) {
+                        boat_need = min(boat_need + 0.5, 1.0); // Significant boost when attacked by boat
+                    }
+                    
+                    // Record attack event for diplomacy (harms relations)
+                    if (empire_id != 0u) {
+                        record_diplomatic_event(boat_empire, empire_id, true, boat_strength_u16, 1.0, frame_data);
+                    }
+                } else {
+                    // REINFORCE: Add boat strength to cell (friendly action)
+                    if (empire_id != 0u) {
+                        total_reinforcement_strength += boat_strength_f;
+                        
+                        // Record reinforcement for diplomacy (improves relations)
+                        record_diplomatic_event(boat_empire, empire_id, false, boat_strength_u16, 1.0, frame_data);
                     }
                 }
             }
@@ -391,15 +446,36 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             current_strength_f -= casualties;
             
             // Check if this results in conquest
-            let required_strength_for_conquest = current_strength_f * 3.0;
-            
-            if (total_attack_strength >= required_strength_for_conquest && current_strength_f <= 0.0) {
+            // Defender is conquered if their strength drops to 0 or below
+            if (current_strength_f <= 0.0) {
                 // Full conquest: attacker wins and occupies with remaining strength
                 new_empire_id = attacking_empire;
+                // Conqueror gets the excess attack strength after overcoming the defender
                 let remaining_attack_strength = total_attack_strength - (f32(strength) / 65535.0 * 3.0);
                 new_strength = u32(clamp(remaining_attack_strength * 65535.0, 1000.0, 65535.0)); // Minimum 1000 strength
                 new_need = 3000u; // Reset need for newly conquered cell
                 new_age = 0.0; // Reset age for newly conquered cell
+                
+                // BOAT NEED ON CONQUEST: Count ocean neighbors (like Bevy reference)
+                // Set boat_need based on coastline accessibility (6 - ocean_neighbors)
+                // More ocean = higher boat_need to signal naval capability
+                var ocean_neighbors = 0u;
+                for (var dir: u32 = 0u; dir < 6u; dir++) {
+                    let offset = get_hex_neighbor_offset(dir, pos.y);
+                    let neighbor_pos = pos + offset;
+                    if (neighbor_pos.x >= 0 && neighbor_pos.x < i32(dims.x) && 
+                        neighbor_pos.y >= 0 && neighbor_pos.y < i32(dims.y)) {
+                        let neighbor_terrain = get_terrain(neighbor_pos);
+                        let neighbor_altitude = neighbor_terrain.r;
+                        if (neighbor_altitude < ocean_cutoff) {
+                            ocean_neighbors++;
+                        }
+                    }
+                }
+                // Reference: boat_need = 6.0 - coastlines.len() (fewer land neighbors = more coastal)
+                // We invert: more ocean neighbors = more boat_need
+                // Scale to 0.0-2.0 range (0 ocean = 0.0, 6 ocean = 2.0)
+                boat_need = f32(ocean_neighbors) / 3.0; // 0 to 2.0
             } else {
                 // Attrition only: defender survives but is weakened
                 current_strength_f = max(current_strength_f, 0.01); // Minimum survival strength
@@ -411,6 +487,76 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             new_strength = u32(clamp(current_strength_f * 65535.0, 0.0, 65535.0));
         }
         
+        // PHASE 1.5: Peaceful territory transfers to reduce border gore
+        // If surrounded by allied neighbors, small chance of peaceful transfer
+        if (new_empire_id != 0u && total_attack_strength == 0.0) {
+            // First pass: find the ally with the most neighbors (max 6 comparisons)
+            var count_0 = 0u; var empire_0 = 0u;
+            var count_1 = 0u; var empire_1 = 0u;
+            var count_2 = 0u; var empire_2 = 0u;
+            var count_3 = 0u; var empire_3 = 0u;
+            var count_4 = 0u; var empire_4 = 0u;
+            var count_5 = 0u; var empire_5 = 0u;
+            
+            for (var dir = 0u; dir < 6u; dir++) {
+                let neighbor_offset = get_hex_neighbor_offset(dir, pos.y);
+                let neighbor_pos = pos + neighbor_offset;
+                let neighbor_cell = get_cell(neighbor_pos);
+                let neighbor_empire = float_to_u16(neighbor_cell.r);
+                
+                // Check if neighbor is an ally (not self, not unclaimed)
+                if (neighbor_empire != 0u && neighbor_empire != new_empire_id) {
+                    let relation = get_diplomacy(new_empire_id, neighbor_empire);
+                    if (relation >= 0.25) { // Allied threshold
+                        // Track up to 6 different allied empires
+                        if (empire_0 == 0u) { empire_0 = neighbor_empire; count_0 = 1u; }
+                        else if (neighbor_empire == empire_0) { count_0++; }
+                        else if (empire_1 == 0u) { empire_1 = neighbor_empire; count_1 = 1u; }
+                        else if (neighbor_empire == empire_1) { count_1++; }
+                        else if (empire_2 == 0u) { empire_2 = neighbor_empire; count_2 = 1u; }
+                        else if (neighbor_empire == empire_2) { count_2++; }
+                        else if (empire_3 == 0u) { empire_3 = neighbor_empire; count_3 = 1u; }
+                        else if (neighbor_empire == empire_3) { count_3++; }
+                        else if (empire_4 == 0u) { empire_4 = neighbor_empire; count_4 = 1u; }
+                        else if (neighbor_empire == empire_4) { count_4++; }
+                        else if (empire_5 == 0u) { empire_5 = neighbor_empire; count_5 = 1u; }
+                        else if (neighbor_empire == empire_5) { count_5++; }
+                    }
+                }
+            }
+            
+            // Find the maximum count
+            var max_count = count_0;
+            var dominant_ally = empire_0;
+            if (count_1 > max_count) { max_count = count_1; dominant_ally = empire_1; }
+            if (count_2 > max_count) { max_count = count_2; dominant_ally = empire_2; }
+            if (count_3 > max_count) { max_count = count_3; dominant_ally = empire_3; }
+            if (count_4 > max_count) { max_count = count_4; dominant_ally = empire_4; }
+            if (count_5 > max_count) { max_count = count_5; dominant_ally = empire_5; }
+            
+            // Check for peaceful transfer based on neighbor count
+            if (max_count >= 4u && dominant_ally != 0u) {
+                // Calculate transfer probability based on neighbor count
+                var transfer_chance = 0u;
+                if (max_count == 4u) {
+                    transfer_chance = 1u;   // 1% chance
+                } else if (max_count == 5u) {
+                    transfer_chance = 5u;   // 5% chance
+                } else if (max_count == 6u) {
+                    transfer_chance = 10u;  // 10% chance
+                }
+                
+                // Random check for transfer
+                let random_roll = rng_range(new_empire_id, dominant_ally, frame_data + u32(pos.x * 1000 + pos.y), 1u, 100u);
+                if (random_roll <= transfer_chance) {
+                    // Peaceful transfer to dominant ally
+                    new_empire_id = dominant_ally;
+                    // Keep strength and age, reset need slightly
+                    new_need = u32(f32(new_need) * 0.8);
+                }
+            }
+        }
+        
         // PHASE 2: Generate strength, calculate need, and make decisions for occupied cells
         if (new_empire_id != 0u) {
             // Calculate need based on enemy pressure and friendly support
@@ -420,6 +566,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             var min_enemy_direction = 6u;
             var min_unclaimed_strength = 2.0;
             var min_unclaimed_direction = 6u;
+            var min_neutral_strength = 2.0;
+            var min_neutral_direction = 6u;
+            var min_neutral_empire = 0u;
             var max_friendly_need = 0.0;
             var max_need_direction = 6u;
             var friendly_neighbors = 0u;
@@ -456,9 +605,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         }
                     } else {
                         // Different empire or unclaimed neighbor
-                        
                         if (neighbor_empire == 0u) {
                             // Unclaimed territory - track as expansion target
+                            // No friction with unclaimed (ocean) borders
                             enemy_neighbors++;
                             calculated_need += neighbor_strength; // Add pressure from unclaimed
                             calculated_need -= 0.9 * neighbor_strength; // But easier to expand
@@ -477,18 +626,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                             let relation = get_diplomacy(new_empire_id, neighbor_empire);
                             
                             if (relation > 0.3) {
-                                // ALLIED: Reduced internal need, but can receive help from allies
+                                // ALLIED: No defensive need generated - treat as friendly border
+                                // Need propagates FROM allies to guide reinforcements to their fights
                                 allied_neighbors++;
                                 
-                                // Allow need to propagate FROM allies (with 50% penalty for cross-border inefficiency)
-                                let ally_need_contribution = neighbor_need * 0.5;
+                                // Allow need to propagate FROM allies (with small 15% penalty for cross-border coordination)
+                                // This allows reinforcements to flow freely through allied territory to reach the actual fight
+                                let ally_need_contribution = neighbor_need * 0.85;
                                 if (ally_need_contribution > max_friendly_need) {
                                     max_friendly_need = ally_need_contribution;
                                     max_need_direction = dir;
                                 }
                                 
-                                // Very minimal defensive pressure from allies (secure border)
-                                calculated_need += neighbor_strength * 0.05;
+                                // NO defensive need added - allied borders should be transparent to need flow
                             } else if (relation >= -0.3) {
                                 // NEUTRAL: Need scales with tension level
                                 // relation = -0.3 to 0.3: from hostile threshold to allied threshold
@@ -505,22 +655,23 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                                 enemy_neighbors++;
                                 calculated_need += neighbor_strength;
                             }
-                            
-                            // Border pressure detection: Report when significantly stronger than neighbor
-                            // Only stronger cell reports (reduces redundancy), only for non-allied empires
-                            if (relation <= 0.3) {
-                                let strength_ratio = current_strength_f / max(neighbor_strength, 0.01);
-                                // Report border pressure if 2x or more stronger
-                                if (strength_ratio >= 2.0) {
-                                    record_border_pressure(new_empire_id, neighbor_empire, 1.0, frame_data);
-                                }
-                            }
                         }
                         
                         // Track enemy strength for attack decisions
-                        // ONLY consider hostile empires (relation < -0.3) as valid attack targets
+                        // Hostile threshold varies by empire aggression personality
                         let relation = get_diplomacy(new_empire_id, neighbor_empire);
-                        if (relation < -0.3) {
+                        
+                        // Get personality for hostile threshold adjustment
+                        let empire_params = get_empire_params(new_empire_id);
+                        let aggression = empire_params.g;
+                        
+                        // Hostile threshold varies by aggression:
+                        // Low aggression (0.0): attack at -0.3 (very hostile)
+                        // Medium aggression (0.5): attack at -0.2
+                        // High aggression (1.0): attack at -0.1 (slightly negative)
+                        let hostile_threshold = mix(-0.3, -0.1, aggression);
+                        
+                        if (relation < hostile_threshold) {
                             // This is a HOSTILE neighbor - valid attack target
                             if (neighbor_strength > max_enemy_strength) {
                                 max_enemy_strength = neighbor_strength;
@@ -534,10 +685,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                                     min_enemy_direction = dir;
                                 }
                             }
+                        } else if (relation >= hostile_threshold && relation <= 0.3) {
+                            // This is a NEUTRAL neighbor - potential target for aggressive empires
+                            if (neighbor_strength < min_neutral_strength) {
+                                min_neutral_strength = neighbor_strength;
+                                min_neutral_direction = dir;
+                                min_neutral_empire = neighbor_empire;
+                            } else if (neighbor_strength == min_neutral_strength) {
+                                // If strengths are equal, randomly choose between them
+                                if (rng_range(global_id.x, global_id.y, frame_data, dir * 11u, 2u) == 0u) {
+                                    min_neutral_direction = dir;
+                                    min_neutral_empire = neighbor_empire;
+                                }
+                            }
                         }
                     }
                 }
-            }            
+            }
+            
             // Normalize need by number of enemy neighbors
             if (enemy_neighbors > 0u) {
                 calculated_need /= f32(enemy_neighbors);
@@ -651,9 +816,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     if (target_empire != 0u && target_empire != new_empire_id) {
                         let relation = get_diplomacy(new_empire_id, target_empire);
                         // relation: -1.0 (hostile) to 1.0 (allied)
-                        // For hostile relations (<-0.3), modify attack strength
+                        // For hostile relations, modify attack strength
                         // More hostile = lower threshold (easier to attack)
-                        diplomacy_attack_modifier = 1.0 - (relation * 0.7); // Range: 0.3 (very hostile) to 1.7 (neutral edge)
+                        // More aggressive = more willing to commit strength
+                        let base_modifier = 1.0 - (relation * 0.7); // Range: 0.3 to 1.7
+                        
+                        // Aggression makes empires commit more strength at earlier hostility levels
+                        // High aggression: willing to attack even at -0.1 relation with full strength
+                        // Low aggression: cautious even at -1.0 relation
+                        let aggression_boost = aggression * 0.5; // 0.0 to 0.5 bonus
+                        diplomacy_attack_modifier = base_modifier + aggression_boost;
                     }
                     
                     let ideal_attack_strength = target_strength * final_attack_ratio * diplomacy_attack_modifier;
@@ -684,6 +856,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                     let min_attack_threshold = 1.0 / 4095.0;
                     if (attack_strength > min_attack_threshold) {
                         should_attack = true;
+                    }
+                } else if (min_neutral_direction < 6u && aggression > 0.5) {
+                    // Third priority: High-aggression empires attack weak neutrals
+                    // This creates more conflicts across the map
+                    // LOWERED threshold from 0.6 to 0.5 (50% of empires can do this)
+                    let strength_ratio = available_for_action / max(min_neutral_strength, 0.01);
+                    
+                    // Require strength advantage to attack neutrals
+                    // MUCH MORE AGGRESSIVE: aggression = 0.5: need 2.5:1, aggression = 1.0: need 1.5:1
+                    let required_advantage = mix(2.5, 1.5, (aggression - 0.5) / 0.5);
+                    
+                    if (strength_ratio >= required_advantage) {
+                        attack_target_direction = min_neutral_direction;
+                        target_strength = min_neutral_strength;
+                        
+                        // Use moderate strength for neutral attacks (not full commitment)
+                        attack_strength = available_for_action * 0.5;
+                        
+                        let min_attack_threshold = 1.0 / 4095.0;
+                        if (attack_strength > min_attack_threshold) {
+                            should_attack = true;
+                        }
                     }
                 }
                 
@@ -812,6 +1006,90 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     
+    // BOAT SPAWNING LOGIC
+    // Only land cells with an empire can spawn boats
+    if (new_empire_id != 0u && !is_water) {
+        // Update boat need: decays very slowly (99.8% retention per frame)
+        // Takes ~350 frames to halve - sustains naval campaigns
+        boat_need *= 0.998;
+        
+        // IMPORTANT: Add tiny baseline boat_need for coastal cells to ensure exploration
+        // Count ocean neighbors to determine if this is a coastal cell
+        var ocean_neighbors = 0u;
+        for (var dir: u32 = 0u; dir < 6u; dir++) {
+            let offset = get_hex_neighbor_offset(dir, pos.y);
+            let neighbor_pos = pos + offset;
+            if (neighbor_pos.x >= 0 && neighbor_pos.x < i32(dims.x) && 
+                neighbor_pos.y >= 0 && neighbor_pos.y < i32(dims.y)) {
+                let neighbor_terrain = get_terrain(neighbor_pos);
+                let neighbor_altitude = neighbor_terrain.r;
+                if (neighbor_altitude < ocean_cutoff) {
+                    ocean_neighbors++;
+                }
+            }
+        }
+        
+        // Ensure coastal cells always have minimum boat_need for exploration
+        if (ocean_neighbors > 0u && boat_need < 0.1) {
+            boat_need = max(boat_need, 0.1); // Minimum 0.1 for any coastal cell
+        }
+        
+        // Try to spawn a boat if:
+        // 1. We have good strength (> 30000, ~46% of max)
+        // 2. We're coastal (have adjacent ocean)
+        let strength_f = f32(new_strength) / 65535.0;
+        if (new_strength > 30000u && ocean_neighbors > 0u) {
+            // Very aggressive spawn rates with baseline probing
+            // Add a constant baseline chance (5%) plus scaled boat_need
+            // This ensures even low boat_need cells send occasional exploratory boats
+            // Use power curve (exponent 0.4) for even stronger low-value boost
+            // Examples:
+            //  - boat_need=0.10: ~5% baseline + ~6% scaled = ~11%
+            //  - boat_need=0.50: ~5% baseline + ~33% scaled = ~38%
+            //  - boat_need=1.0:  ~5% baseline + ~50% scaled = ~55%
+            let adjusted_need = pow(boat_need, 0.4);
+            let spawn_chance = u32(min(5.0 + adjusted_need * 50.0, 100.0));
+            
+            // Check all 6 hex directions for adjacent ocean cells
+            var boats_spawned_this_frame = 0u;
+            for (var dir: u32 = 0u; dir < 6u; dir++) {
+                let offset = get_hex_neighbor_offset(dir, pos.y);
+                let neighbor_pos = pos + offset;
+                
+                // Check bounds
+                if (neighbor_pos.x >= 0 && neighbor_pos.x < i32(dims.x) && 
+                    neighbor_pos.y >= 0 && neighbor_pos.y < i32(dims.y)) {
+                    
+                    let neighbor_terrain = get_terrain(neighbor_pos);
+                    let neighbor_altitude = neighbor_terrain.r;
+                    let neighbor_is_water = neighbor_altitude < ocean_cutoff;
+                    
+                    // If this neighbor is ocean, try to spawn a boat there
+                    if (neighbor_is_water) {
+                        // Each ocean neighbor gets independent spawn roll
+                        let spawn_rng = pcg_hash(global_id.x, global_id.y ^ (dir << 16u), frame_data);
+                        if ((spawn_rng % 100u) < spawn_chance) {
+                            // Spawn a boat!
+                            let neighbor_idx = u32(neighbor_pos.y) * dims.x + u32(neighbor_pos.x);
+                            let spawn_data = (new_empire_id << 16u) | dir; // Empire ID in upper 16 bits, direction in lower 16 bits
+                            atomicMax(&boat_spawns[neighbor_idx], spawn_data);
+                            
+                            boats_spawned_this_frame++;
+                            // Only spawn one boat per frame
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // Only reduce boat_need if we actually spawned boats
+            if (boats_spawned_this_frame > 0u) {
+                // Miniscule reduction - almost continuous spawning
+                boat_need = max(boat_need - 0.01, 0.0);
+            }
+        }
+    }
+    
     // Write the new cell state
     let output_color = vec4<f32>(
         u16_to_float(new_empire_id),
@@ -822,6 +1100,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     
     textureStore(output_texture, pos, output_color);
     
-    // Write auxiliary data (age) to auxiliary texture - stored as normalized float
-    textureStore(aux_output_texture, pos, vec4<f32>(new_age, 0.0, 0.0, 1.0));
+    // Write auxiliary data (age, boat_need) to auxiliary texture
+    textureStore(aux_output_texture, pos, vec4<f32>(new_age, boat_need, 0.0, 1.0));
 }

@@ -235,7 +235,12 @@ impl ApplicationHandler for App {
                                     if let Some(state) = &mut self.state {
                                         state.simulation.set_render_mode(RenderMode::Diplomacy, &state.graphics);
                                     }
-                                },
+                                }
+                                KeyCode::Digit7 => {
+                                    if let Some(state) = &mut self.state {
+                                        state.simulation.set_render_mode(RenderMode::BoatNeed, &state.graphics);
+                                    }
+                                }
                                 _ => {}
                             }
                         },
@@ -315,6 +320,7 @@ fn main() {
     println!("  4 - Action visualization mode");
     println!("  5 - Age visualization mode (red=new, green=old)");
     println!("  6 - Diplomacy perspective mode (shows relations from selected empire's POV)");
+    println!("  7 - Boat Need heatmap (blue=low, cyan=med, yellow=high, red=coastal)");
     println!("  Left Click - Select perspective empire in Diplomacy mode (or claim territory in other modes)");
     println!("  Right Click - Unclaim territory");
     println!("  ESC - Exit");

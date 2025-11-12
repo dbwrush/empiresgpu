@@ -105,7 +105,7 @@ impl Camera {
         self.y = self.y.clamp(-margin, game_size + margin);
     }
     
-    // ⚠️ WARNING: CAMERA SYSTEM IS WORKING PERFECTLY - DO NOT MODIFY! ⚠️
+    // WARNING: CAMERA SYSTEM IS WORKING PERFECTLY - DO NOT MODIFY!
     // This camera matrix calculation is correct and matches the mouse coordinate conversion
     pub fn update_matrix(&self, queue: &wgpu::Queue, window_size: winit::dpi::PhysicalSize<u32>, game_size: f32) {
         // Calculate proper orthographic projection matrix
@@ -142,7 +142,7 @@ impl Camera {
         );
     }
     
-    // ⚠️ WARNING: MOUSE COORDINATE SYSTEM IS WORKING PERFECTLY - DO NOT MODIFY! ⚠️
+    // WARNING: MOUSE COORDINATE SYSTEM IS WORKING PERFECTLY - DO NOT MODIFY!
     // This coordinate conversion is correctly synchronized with the camera matrix
     pub fn screen_to_game_coords(&self, screen_x: f64, screen_y: f64, window_size: winit::dpi::PhysicalSize<u32>, game_size: f32) -> Option<(u32, u32)> {
         let window_width = window_size.width as f64;

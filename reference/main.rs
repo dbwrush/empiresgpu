@@ -214,43 +214,34 @@ impl Boat {
             }
         }
         
-                /*EVEN
-                (-1, -1) => 0,
-                (0, -1) => 1,
-                (1, 0) => 3,
-                (0, 1) => 5,
-                (-1, 1) => 4,
-                (-1, 0) => 2,
-                _ => 0, */
-
-                /*ODD
-                (0, -1) => 0,
-                (1, -1) => 1,
-                (1, 0) => 3,
-                (1, 1) => 5,
-                (0, 1) => 4,
-                (-1, 0) => 2,
-                _ => 0, */
+                /*CORRECT HEX GRID MAPPING (even-r offset coordinates)
+                Direction 0 = East: (x+1, y)
+                Direction 1 = Northeast: even=(x+1, y-1), odd=(x, y-1)
+                Direction 2 = Northwest: even=(x, y-1), odd=(x-1, y-1)
+                Direction 3 = West: (x-1, y)
+                Direction 4 = Southwest: even=(x, y+1), odd=(x-1, y+1)
+                Direction 5 = Southeast: even=(x+1, y+1), odd=(x, y+1)
+                */
 
         //check if we're on an even or odd row (due to hexagonal grid)
         if position.1 % 2 == 0 {//even
             match use_direction {
-                0 => { position.0 -= 1; position.1 -= 1; } // (x-1, y-1)
-                1 => { position.1 -= 1; }                  // (x, y-1)
-                2 => { position.0 += 1; }                  // (x-1, y)
-                3 => { position.1 += 1; }                  // (x+1, y)
-                4 => { position.0 -= 1; position.1 += 1; } // (x-1, y+1)
-                5 => { position.0 -= 1; }                  // (x, y+1)
+                0 => { position.0 += 1; }                  // East: (x+1, y)
+                1 => { position.0 += 1; position.1 -= 1; } // Northeast: (x+1, y-1)
+                2 => { position.1 -= 1; }                  // Northwest: (x, y-1)
+                3 => { position.0 -= 1; }                  // West: (x-1, y)
+                4 => { position.1 += 1; }                  // Southwest: (x, y+1)
+                5 => { position.0 += 1; position.1 += 1; } // Southeast: (x+1, y+1)
                 _ => {}
             }
         } else {//odd
             match use_direction {
-                0 => { position.1 -= 1; }                  // (x, y-1)
-                1 => { position.0 += 1; position.1 -= 1; } // (x+1, y-1)
-                2 => { position.0 -= 1; }                  // (x-1, y)
-                3 => { position.0 += 1; position.1 += 1; }                  // (x+1, y)
-                4 => { position.1 += 1; }                  // (x, y+1)
-                5 => { position.0 -= 1;} // (x+1, y+1)
+                0 => { position.0 += 1; }                  // East: (x+1, y)
+                1 => { position.1 -= 1; }                  // Northeast: (x, y-1)
+                2 => { position.0 -= 1; position.1 -= 1; } // Northwest: (x-1, y-1)
+                3 => { position.0 -= 1; }                  // West: (x-1, y)
+                4 => { position.0 -= 1; position.1 += 1; } // Southwest: (x-1, y+1)
+                5 => { position.1 += 1; }                  // Southeast: (x, y+1)
                 _ => {}
             }
         }

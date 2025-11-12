@@ -2,9 +2,35 @@ use wgpu::util::DeviceExt;
 use crate::graphics::{GraphicsContext, load_shader};
 use noise::{NoiseFn, Simplex};
 use std::collections::HashMap;
+use rand::Rng;
+use std::sync::{Arc, Mutex};
+use crossbeam::channel::{Sender, Receiver, unbounded};
 
 mod diplomacy;
 use diplomacy::DiplomacyState;
+
+/// Message sent to diplomacy worker thread
+#[derive(Clone)]
+struct DiplomacyWorkRequest {
+    counters: Vec<u32>,
+    personality_diffs: Vec<f32>,
+    frame_count: u32,
+}
+
+/// Message received from diplomacy worker thread
+struct DiplomacyWorkResponse {
+    relations_buffer: Vec<f32>,
+}
+
+/// Boat entity - managed on CPU, integrates with GPU simulation
+#[derive(Debug, Clone)]
+struct Boat {
+    position: (f32, f32),  // Floating point position for smooth movement
+    empire_id: u16,
+    strength: u16,
+    direction: u8,         // 0-5 for hex directions
+    age: u32,              // Frames since spawn
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RenderMode {
@@ -14,16 +40,23 @@ pub enum RenderMode {
     Action = 3,
     Age = 4,
     Diplomacy = 5,
+    BoatNeed = 6,
 }
 
 // Generate terrain data using simplex noise with cylindrical world wrapping
 fn generate_terrain_data(size: u32) -> Vec<u8> {
     println!("Generating terrain data with cylindrical world wrapping...");
     
-    // Multiple noise layers for varied terrain
-    let noise = Simplex::new(12345);
-    let noise2 = Simplex::new(67890);
-    let noise3 = Simplex::new(54321);
+    // Multiple noise layers for varied terrain with random seeds
+    let mut rng = rand::rng();
+    let seed1: u32 = rng.random();
+    let seed2: u32 = rng.random();
+    let seed3: u32 = rng.random();
+    println!("Terrain seeds: {}, {}, {}", seed1, seed2, seed3);
+    
+    let noise = Simplex::new(seed1);
+    let noise2 = Simplex::new(seed2);
+    let noise3 = Simplex::new(seed3);
     
     let mut terrain_data = Vec::with_capacity((size * size * 4) as usize);
     
@@ -123,6 +156,20 @@ pub struct EmpireSimulation {
     diplomacy_relations_buffer: wgpu::Buffer, // Current relations matrix (2048×2048 f32s)
     perspective_empire_buffer: wgpu::Buffer,  // Uniform buffer for perspective empire
     
+    // Reusable buffer for zeroing counters (allocated once, ~83MB)
+    zero_counters_buffer: Vec<u32>,
+    
+    // Boat system
+    boats: Vec<Boat>,                       // Active boats (CPU-managed)
+    boat_landings_buffer: wgpu::Buffer,     // GPU buffer for boat landings
+    boat_landings_cpu: Vec<u32>,            // CPU staging for boat landings
+    boat_spawns_buffer: wgpu::Buffer,       // GPU buffer for boat spawns from cells
+    boat_spawns_staging_buffer: wgpu::Buffer, // CPU staging for reading boat spawns
+    terrain_data: Vec<u8>,                  // Cached terrain for collision detection
+    empire_ownership: Vec<u16>,             // Simplified CPU-side empire ownership map (updated periodically)
+    empire_readback_buffer: wgpu::Buffer,   // Staging buffer for reading empire data from GPU
+    empire_pending_readback: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,  // Pending empire readback
+    
     pub compute_bind_group_a: wgpu::BindGroup,
     pub compute_bind_group_b: wgpu::BindGroup,
     pub display_bind_group_a: wgpu::BindGroup,
@@ -139,7 +186,10 @@ pub struct EmpireSimulation {
     pub render_pipeline_action: wgpu::RenderPipeline,
     pub render_pipeline_age: wgpu::RenderPipeline,
     pub render_pipeline_diplomacy: wgpu::RenderPipeline,
+    pub render_pipeline_boat_need: wgpu::RenderPipeline,
     pub terrain_pipeline: wgpu::RenderPipeline,  // For terrain rendering
+    pub boat_pipeline: wgpu::RenderPipeline,     // For boat rendering
+    pub boat_instance_buffer: wgpu::Buffer,      // Instance buffer for boat rendering
     pub current_render_mode: RenderMode,
     pub current_is_a: bool,
     pub frame_count: u32,
@@ -158,6 +208,14 @@ pub struct EmpireSimulation {
     // Diplomacy state
     diplomacy_state: DiplomacyState,          // CPU-side diplomacy processor
     diplomacy_pending_map: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>, // Async map receiver
+    
+    // Diplomacy worker thread communication
+    diplomacy_work_sender: Sender<DiplomacyWorkRequest>,   // Send work to background thread
+    diplomacy_result_receiver: Receiver<DiplomacyWorkResponse>,  // Receive results from background thread
+    diplomacy_processing: bool,  // Track if diplomacy is currently being processed
+    
+    // Boat spawns async readback
+    boat_spawns_pending_map: Option<std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>>,
 }
 
 /// Empire personality traits (0-255 for each)
@@ -195,6 +253,12 @@ impl EmpireSimulation {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
+        // Generate random seeds for empire initialization
+        let mut rng = rand::rng();
+        let shuffle_seed: u32 = rng.random();
+        let spawn_seed: u32 = rng.random();
+        println!("Empire initialization seeds - shuffle: {}, spawn: {}", shuffle_seed, spawn_seed);
+        
         // First pass: collect all valid land positions
         let mut land_positions = Vec::new();
         for y in 0..game_size {
@@ -212,19 +276,26 @@ impl EmpireSimulation {
         // Shuffle the land positions using a deterministic shuffle based on hashing
         for i in (1..land_positions.len()).rev() {
             let mut hasher = DefaultHasher::new();
-            (i, 54321u32).hash(&mut hasher); // Seed for shuffle consistency
+            (i, shuffle_seed).hash(&mut hasher); // Seed for shuffle consistency
             let j = (hasher.finish() as usize) % (i + 1);
             land_positions.swap(i, j);
         }
         
         // Spawn empires on shuffled land positions
         let empire_spawn_chance = 0.005; // 0.5% chance per land cell
+        let max_empires = 2048u16; // Hard limit for diplomacy system
         for (x, y) in &land_positions {
+            // Stop spawning if we've hit the maximum empire limit
+            if empire_id_counter > max_empires {
+                println!("  -> Reached maximum empire limit ({}), stopping spawn", max_empires);
+                break;
+            }
+            
             let mut hasher = DefaultHasher::new();
-            (*x, *y, 12345u32).hash(&mut hasher);
+            (*x, *y, spawn_seed).hash(&mut hasher);
             let random_val = (hasher.finish() % 1000) as f32 / 1000.0;
             
-            if random_val < empire_spawn_chance && empire_id_counter < 65535 {
+            if random_val < empire_spawn_chance {
                 let idx = ((y * game_size + x) * 4) as usize;
                 initial_data[idx] = empire_id_counter;     // R: Empire ID
                 initial_data[idx + 1] = 10000u16;          // G: Strength (scaled up from 200 to ~10000 for 16-bit)
@@ -299,11 +370,19 @@ impl EmpireSimulation {
         
         // Hard limit check - program cannot run with more empires than diplomacy system supports
         if num_spawned_empires > max_empires as u16 {
-            panic!("❌ CRITICAL: {} empires spawned, but diplomacy system only supports {}. Reduce empire count or increase MAX_EMPIRES.", 
+            panic!("CRITICAL: {} empires spawned, but diplomacy system only supports {}. Reduce empire count or increase MAX_EMPIRES.", 
                    num_spawned_empires, max_empires);
         }
         
         println!("Creating empire parameters texture ({}x{}) for {} empires...", max_empires, max_empires, num_spawned_empires);
+        
+        // Generate random seeds for empire personality traits
+        let diplomacy_seed: u32 = rng.random();
+        let aggression_seed: u32 = rng.random();
+        let expansion_seed: u32 = rng.random();
+        let cooperation_seed: u32 = rng.random();
+        println!("Empire personality seeds - diplomacy: {}, aggression: {}, expansion: {}, cooperation: {}", 
+                 diplomacy_seed, aggression_seed, expansion_seed, cooperation_seed);
         
         // Generate empire parameters data
         // Channel layout: R=diplomacy (opinion of other empire, 0-255), G=aggression (0-255), 
@@ -320,22 +399,22 @@ impl EmpireSimulation {
                 let (diplomacy, aggression, expansion, cooperation) = if empire_id <= num_spawned_empires {
                     // Generate random diplomacy opinion for this empire vs target empire
                     let mut hasher = DefaultHasher::new();
-                    (empire_id, target_empire_id, 54321u32).hash(&mut hasher); // Seed for consistency
+                    (empire_id, target_empire_id, diplomacy_seed).hash(&mut hasher); // Seed for consistency
                     let diplomacy_random = (hasher.finish() % 256) as u8;
                     
                     // Generate random aggression for this empire (same for all targets)
                     let mut hasher2 = DefaultHasher::new();
-                    (empire_id, 98765u32).hash(&mut hasher2);
+                    (empire_id, aggression_seed).hash(&mut hasher2);
                     let aggression_random = (hasher2.finish() % 256) as u8;
                     
                     // Generate random expansion trait (0=defensive, 255=expansionist)
                     let mut hasher3 = DefaultHasher::new();
-                    (empire_id, 13579u32).hash(&mut hasher3);
+                    (empire_id, expansion_seed).hash(&mut hasher3);
                     let expansion_random = (hasher3.finish() % 256) as u8;
                     
                     // Generate random cooperation trait (0=selfish, 255=cooperative)
                     let mut hasher4 = DefaultHasher::new();
-                    (empire_id, 24680u32).hash(&mut hasher4);
+                    (empire_id, cooperation_seed).hash(&mut hasher4);
                     let cooperation_random = (hasher4.finish() % 256) as u8;
                     
                     (diplomacy_random, aggression_random, expansion_random, cooperation_random)
@@ -504,6 +583,48 @@ impl EmpireSimulation {
             0,
             bytemuck::cast_slice(&vec![0.0f32; 2048 * 2048]),
         );
+        
+        // Create boat landing buffer (one u32 per cell for boat attacks)
+        // Format: upper 16 bits = empire_id, lower 16 bits = strength
+        let boat_landings_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Boat Landings Buffer"),
+            size: ((game_size * game_size) as usize * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Initialize boat landings to zero
+        graphics.queue.write_buffer(
+            &boat_landings_buffer,
+            0,
+            bytemuck::cast_slice(&vec![0u32; (game_size * game_size) as usize]),
+        );
+        
+        // Create boat spawns buffer (one u32 per cell for GPU-initiated boat spawns)
+        // Format: upper 16 bits = empire_id, lower 16 bits = direction (0-5)
+        let boat_spawns_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Boat Spawns Buffer"),
+            size: ((game_size * game_size) as usize * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        
+        // Create staging buffer for reading boat spawns from GPU
+        let boat_spawns_staging_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Boat Spawns Staging Buffer"),
+            size: ((game_size * game_size) as usize * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Create staging buffer for reading empire ownership from GPU
+        // RGBA16Unorm texture: each pixel = 4 u16s, we only need R channel for empire_id
+        let empire_readback_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Empire Readback Buffer"),
+            size: (game_size * game_size * 8) as u64,  // 4 channels * 2 bytes per u16
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Create compute bind group layout
         let compute_bind_group_layout = graphics.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -599,6 +720,28 @@ impl EmpireSimulation {
                     },
                     count: None,
                 },
+                // Binding 9: Boat landings buffer (read-only storage)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // Binding 10: Boat spawns buffer (read-write storage with atomics)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         
@@ -660,6 +803,14 @@ impl EmpireSimulation {
                     binding: 8,
                     resource: diplomacy_relations_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: boat_landings_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: boat_spawns_buffer.as_entire_binding(),
+                },
             ],
         });
         
@@ -702,6 +853,14 @@ impl EmpireSimulation {
                 wgpu::BindGroupEntry {
                     binding: 8,
                     resource: diplomacy_relations_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: boat_landings_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: boat_spawns_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -846,6 +1005,7 @@ impl EmpireSimulation {
         let render_pipeline_need = create_render_pipeline("shaders/empire_render_need.wgsl", "Need Render Pipeline");
         let render_pipeline_action = create_render_pipeline("shaders/empire_render_action.wgsl", "Action Render Pipeline");
         let render_pipeline_age = create_render_pipeline("shaders/empire_render_age.wgsl", "Age Render Pipeline");
+        let render_pipeline_boat_need = create_render_pipeline("shaders/empire_render_boat_need.wgsl", "Boat Need Render Pipeline");
         
         // Create diplomacy perspective pipeline (has different bind group layout)
         let diplomacy_shader = load_shader(&graphics.device, "shaders/empire_render_diplomacy.wgsl");
@@ -1050,6 +1210,119 @@ impl EmpireSimulation {
         
         println!("Empire simulation and terrain pipelines created! Ready to simulate.");
         
+        // Create boat render pipeline
+        // Boats use a simple layout: only camera bind group (no display textures needed)
+        let boat_shader = load_shader(&graphics.device, "shaders/boat_render.wgsl");
+        let boat_pipeline = graphics.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Boat Render Pipeline"),
+            layout: Some(&graphics.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Boat Pipeline Layout"),
+                bind_group_layouts: &[camera_bind_group_layout],  // Only camera at group 0
+                push_constant_ranges: &[],
+            })),
+            vertex: wgpu::VertexState {
+                module: &boat_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 5]>() as u64,  // position (2) + color (3)
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                offset: 0,
+                                shader_location: 0,
+                                format: wgpu::VertexFormat::Float32x2,  // position
+                            },
+                            wgpu::VertexAttribute {
+                                offset: std::mem::size_of::<[f32; 2]>() as u64,
+                                shader_location: 1,
+                                format: wgpu::VertexFormat::Float32x3,  // color
+                            },
+                        ],
+                    },
+                ],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &boat_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: graphics.config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),  // Need alpha blending for transparency
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,  // No culling for boats
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+        
+        // Create boat instance buffer (max 10,000 boats)
+        let boat_instance_buffer = graphics.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Boat Instance Buffer"),
+            size: (50000 * std::mem::size_of::<[f32; 5]>()) as u64,  // Support up to 50k boats
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        
+        // Spawn diplomacy worker thread for async processing
+        let (work_sender, work_receiver) = crossbeam::channel::unbounded::<DiplomacyWorkRequest>();
+        let (result_sender, result_receiver) = crossbeam::channel::unbounded::<DiplomacyWorkResponse>();
+        
+        std::thread::spawn(move || {
+            let mut diplomacy_state = DiplomacyState::new();
+            
+            loop {
+                // Wait for work request
+                match work_receiver.recv() {
+                    Ok(request) => {
+                        // Process diplomacy on this background thread
+                        let territory_sizes = std::collections::HashMap::new();
+                        
+                        diplomacy_state.process_counters(
+                            &request.counters,
+                            &territory_sizes,
+                            |a, b| {
+                                let idx = (a as usize) * 2048 + (b as usize);
+                                request.personality_diffs.get(idx).copied().unwrap_or(0.5)
+                            },
+                            request.frame_count,
+                        );
+                        
+                        diplomacy_state.propagate_attack_reactions(&request.counters, |a, b| {
+                            let idx = (a as usize) * 2048 + (b as usize);
+                            request.personality_diffs.get(idx).copied().unwrap_or(0.5)
+                        });
+                        
+                        // Send back the updated relations buffer
+                        let relations_buffer = diplomacy_state.to_buffer().to_vec();
+                        let _ = result_sender.send(DiplomacyWorkResponse {
+                            relations_buffer,
+                        });
+                    }
+                    Err(_) => {
+                        // Channel closed, exit thread
+                        break;
+                    }
+                }
+            }
+        });
+        
         let mut sim = Self {
             texture_a,
             texture_b,
@@ -1073,7 +1346,10 @@ impl EmpireSimulation {
             render_pipeline_action,
             render_pipeline_age,
             render_pipeline_diplomacy,
+            render_pipeline_boat_need,
             terrain_pipeline,
+            boat_pipeline,
+            boat_instance_buffer,
             current_render_mode: RenderMode::Empires,
             current_is_a: true,
             frame_count: 0,
@@ -1089,8 +1365,22 @@ impl EmpireSimulation {
             diplomacy_staging_buffer,
             diplomacy_relations_buffer,
             perspective_empire_buffer,
+            zero_counters_buffer: vec![0u32; 2048 * 2048 * 5],  // Pre-allocate reusable buffer (~83MB)
+            boats: Vec::new(),  // No boats initially
+            boat_landings_buffer,
+            boat_landings_cpu: vec![0u32; (game_size * game_size) as usize],
+            boat_spawns_buffer,
+            boat_spawns_staging_buffer,
+            terrain_data: terrain_data.clone(),  // Keep terrain for boat collision detection
+            empire_ownership: vec![0u16; (game_size * game_size) as usize],  // Initially no owners
+            empire_readback_buffer,
+            empire_pending_readback: None,
             diplomacy_state: DiplomacyState::new(),
             diplomacy_pending_map: None,
+            diplomacy_work_sender: work_sender,
+            diplomacy_result_receiver: result_receiver,
+            diplomacy_processing: false,
+            boat_spawns_pending_map: None,
         };
         
         // Pre-compute personality difference cache (static for the entire game)
@@ -1126,6 +1416,297 @@ impl EmpireSimulation {
         sim
     }
     
+    // Update boat positions and handle spawning/landing
+    fn update_boats(&mut self, graphics: &GraphicsContext) {
+        // Helper function for boat rendering: convert hue to RGB
+        fn hue_to_rgb(hue: f32) -> (f32, f32, f32) {
+            let h = hue / 60.0;
+            let x = 1.0 - (h % 2.0 - 1.0).abs();
+            
+            let (r, g, b) = match h as u32 {
+                0 => (1.0, x, 0.0),
+                1 => (x, 1.0, 0.0),
+                2 => (0.0, 1.0, x),
+                3 => (0.0, x, 1.0),
+                4 => (x, 0.0, 1.0),
+                _ => (1.0, 0.0, x),
+            };
+            
+            (r, g, b)
+        }
+        
+        // Clear boat landings buffer
+        self.boat_landings_cpu.fill(0);
+        
+        let mut landed_count = 0;
+        
+        // Move existing boats and check for landings
+        let mut debug_land_encounters = 0;
+        let mut debug_continued_boats = 0;
+        
+        // Create RNG once for all boats (PERFORMANCE: don't create per boat!)
+        let mut rng = rand::rng();
+        
+        self.boats.retain_mut(|boat| {
+            boat.age += 1;
+            
+            // No age-based despawning - boats should eventually hit land
+            
+            // Move boat on hex grid (discrete cell-to-cell movement like Bevy version)
+            // Boats move every frame for fast movement
+            const MOVE_INTERVAL: u32 = 1; // Move every frame
+            if boat.age % MOVE_INTERVAL != 0 {
+                return true; // Don't move yet, keep boat
+            }
+            
+            // Rare chance to drift in an adjacent direction (2% chance each way)
+            // This doesn't change the boat's stored direction, just the movement this frame
+            let mut use_direction = boat.direction;
+            let drift_check = rng.random_range(0..100);
+            if drift_check < 2 {
+                // Drift clockwise (to the right)
+                use_direction = (use_direction + 1) % 6;
+            } else if drift_check < 4 {
+                // Drift counter-clockwise (to the left)
+                use_direction = if use_direction == 0 { 5 } else { use_direction - 1 };
+            }
+            // Note: boat.direction remains unchanged, so boat generally travels straight
+            
+            // Calculate new position based on hex grid movement
+            let current_x = boat.position.0.round() as i32;
+            let current_y = boat.position.1.round() as i32;
+            let (mut new_x, mut new_y) = Self::hex_neighbor(current_x, current_y, use_direction);
+            
+            // Apply world wrapping on both axes (matching shader behavior)
+            let game_size_i32 = self.game_size as i32;
+            new_x = ((new_x % game_size_i32) + game_size_i32) % game_size_i32;
+            new_y = ((new_y % game_size_i32) + game_size_i32) % game_size_i32;
+            
+            // Calculate indices into RGBA terrain data (4 bytes per pixel)
+            let new_cell_idx = ((new_y as usize) * (self.game_size as usize) + (new_x as usize)) * 4;
+            
+            if new_cell_idx >= self.terrain_data.len() {
+                // Invalid cell - remove boat
+                return false;
+            }
+            
+            // Read altitude from R channel (first byte of RGBA)
+            let altitude = self.terrain_data[new_cell_idx];
+            // Ocean cutoff: 0.53 * 255 = 135
+            let is_land = altitude >= 135;
+            
+            // Debug: Check current position too - remove boats that are on land
+            let current_cell_idx = ((current_y as usize) * (self.game_size as usize) + (current_x as usize)) * 4;
+            let current_altitude = if current_cell_idx < self.terrain_data.len() {
+                self.terrain_data[current_cell_idx]
+            } else {
+                0
+            };
+            let current_is_land = current_altitude >= 135;
+            
+            // Sanity check: if boat is currently on land, remove it immediately
+            if current_is_land {
+                if self.frame_count % 120 == 0 {
+                    println!("WARNING: Removing boat at ({}, {}) - currently on land (altitude {})", current_x, current_y, current_altitude);
+                }
+                return false;
+            }
+            
+            if is_land {
+                debug_land_encounters += 1;
+                
+                // Boat encounters land! Record landing for GPU to process
+                // GPU will decide attack vs reinforce based on empire relations and personality
+                // Format: upper 16 bits = empire_id, lower 16 bits = strength
+                let landing_data = ((boat.empire_id as u32) << 16) | (boat.strength as u32);
+                
+                // Calculate the cell index for boat_landings_cpu buffer (1 u32 per cell)
+                let landing_cell_idx = (new_y as usize) * (self.game_size as usize) + (new_x as usize);
+                
+                // Use atomicMax-style logic: only update if our landing is stronger or same empire
+                let existing = self.boat_landings_cpu[landing_cell_idx];
+                let existing_empire = (existing >> 16) as u16;
+                let existing_strength = (existing & 0xFFFF) as u16;
+                
+                // If same empire or we're stronger, record this landing
+                if existing_empire == boat.empire_id || boat.strength > existing_strength {
+                    self.boat_landings_cpu[landing_cell_idx] = landing_data;
+                    
+                    // Debug: Log successful landings with details
+                    if self.frame_count % 60 == 0 {
+                        let boat_strength_normalized = boat.strength as f32 / 65535.0;
+                        let attack_damage = boat_strength_normalized / 3.0;
+                        println!("Boat landing at ({}, {}): Empire {} with strength {} ({:.2}% normalized)", 
+                            new_x, new_y, boat.empire_id, boat.strength, boat_strength_normalized * 100.0);
+                        println!("   Attack damage = {:.4} ({:.2}%). Conquers cells with strength < {:.4}", 
+                            attack_damage, attack_damage * 100.0, attack_damage);
+                    }
+                }
+                
+                landed_count += 1;
+                
+                // Remove boat (GPU handles the actual attack/reinforce logic)
+                return false;
+            }
+            
+            // Still on water - update position to new cell
+            debug_continued_boats += 1;
+            boat.position.0 = new_x as f32;
+            boat.position.1 = new_y as f32;
+            // Note: boat.direction is NOT updated - it stays constant except for drift on individual moves
+            
+            // Keep boat alive
+            true
+        });
+        
+        // Debug output every 2 seconds
+        if self.frame_count % 120 == 0 {
+            if self.boats.len() > 0 || landed_count > 0 {
+                println!("Boats: {} active, {} landed this cycle (moved: {}, hit land: {})", 
+                    self.boats.len(), landed_count, debug_continued_boats, debug_land_encounters);
+                // Show positions of first 10 boats for easy finding
+                let boats_to_show = self.boats.len().min(10);
+                for i in 0..boats_to_show {
+                    let boat = &self.boats[i];
+                    println!("   Boat {}: pos=({:.1}, {:.1}), empire={}, dir={}", 
+                        i+1, boat.position.0, boat.position.1, boat.empire_id, boat.direction);
+                }
+                if self.boats.len() > 10 {
+                    println!("   ... and {} more boats", self.boats.len() - 10);
+                }
+            }
+        }
+        
+        // Upload boat landings to GPU
+        graphics.queue.write_buffer(
+            &self.boat_landings_buffer,
+            0,
+            bytemuck::cast_slice(&self.boat_landings_cpu),
+        );
+        
+        // Update boat instance buffer for rendering
+        // Upload actual boat positions and colors
+        {
+            let mut instance_data = Vec::new();
+            
+            const MAX_BOATS: usize = 50000;  // Match buffer size
+            let boats_to_render = self.boats.len().min(MAX_BOATS);
+            
+            for boat in self.boats.iter().take(boats_to_render) {
+                // Get the empire color using the same hash-based system as the shader
+                let (r, g, b) = Self::get_empire_color(boat.empire_id);
+                
+                instance_data.push([boat.position.0, boat.position.1, r, g, b]);
+            }
+            
+            // Only write if we have boats
+            if !instance_data.is_empty() {
+                graphics.queue.write_buffer(
+                    &self.boat_instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&instance_data),
+                );
+            }
+            
+            // Debug output
+            if self.frame_count % 60 == 0 && !self.boats.is_empty() {
+                println!("Rendering {} boats on screen (total: {})", instance_data.len(), self.boats.len());
+            }
+        }
+    }
+    
+    // Helper function to convert HSV to RGB
+    fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+        let c = v * s;
+        let h_prime = h / 60.0;
+        let x = c * (1.0 - ((h_prime % 2.0) - 1.0).abs());
+        let m = v - c;
+        
+        let (r, g, b) = if h_prime < 1.0 {
+            (c, x, 0.0)
+        } else if h_prime < 2.0 {
+            (x, c, 0.0)
+        } else if h_prime < 3.0 {
+            (0.0, c, x)
+        } else if h_prime < 4.0 {
+            (0.0, x, c)
+        } else if h_prime < 5.0 {
+            (x, 0.0, c)
+        } else {
+            (c, 0.0, x)
+        };
+        
+        (r + m, g + m, b + m)
+    }
+    
+    // Hash function matching the shader's hash_empire_id
+    fn hash_empire_id(id: u32) -> u32 {
+        let mut x = id;
+        x = ((x >> 16) ^ x).wrapping_mul(0x45d9f3b);
+        x = ((x >> 16) ^ x).wrapping_mul(0x45d9f3b);
+        x = (x >> 16) ^ x;
+        x
+    }
+    
+    // Get empire color matching the shader's get_empire_color function
+    fn get_empire_color(empire_id: u16) -> (f32, f32, f32) {
+        if empire_id == 0 {
+            return (0.0, 0.0, 0.0); // Black for unclaimed
+        }
+        
+        let hash_val = Self::hash_empire_id(empire_id as u32);
+        
+        // Generate HSV values from hash (matching shader logic)
+        let hue = (hash_val % 360) as f32;
+        let saturation = 0.7 + ((hash_val >> 8) % 30) as f32 / 100.0;
+        let value = 0.6 + ((hash_val >> 16) % 20) as f32 / 100.0;
+        
+        Self::hsv_to_rgb(hue, saturation, value)
+    }
+    
+    // Helper function to get hex neighbor coordinates (even-r offset)
+    // Direction mapping matches shader: 0=East, 1=NE, 2=NW, 3=West, 4=SW, 5=SE
+    fn hex_neighbor(x: i32, y: i32, direction: u8) -> (i32, i32) {
+        let is_even_row = y % 2 == 0;
+        match direction {
+            0 => {               // East
+                (x + 1, y)
+            }
+            1 => {               // Northeast
+                if is_even_row {
+                    (x + 1, y - 1)  // Even row: right and up
+                } else {
+                    (x, y - 1)      // Odd row: up only
+                }
+            }
+            2 => {               // Northwest
+                if is_even_row {
+                    (x, y - 1)      // Even row: up only
+                } else {
+                    (x - 1, y - 1)  // Odd row: left and up
+                }
+            }
+            3 => {               // West
+                (x - 1, y)
+            }
+            4 => {               // Southwest
+                if is_even_row {
+                    (x, y + 1)      // Even row: down only
+                } else {
+                    (x - 1, y + 1)  // Odd row: left and down
+                }
+            }
+            5 => {               // Southeast
+                if is_even_row {
+                    (x + 1, y + 1)  // Even row: right and down
+                } else {
+                    (x, y + 1)      // Odd row: down only
+                }
+            }
+            _ => (x, y)
+        }
+    }
+    
     pub fn update(&mut self, graphics: &GraphicsContext) {
         if self.is_paused {
             return;
@@ -1152,6 +1733,10 @@ impl EmpireSimulation {
             label: Some("Empire Simulation Compute Encoder"),
         });
 
+        // Clear boat spawns buffer before compute pass
+        let buffer_size = (self.game_size * self.game_size) as u64 * std::mem::size_of::<u32>() as u64;
+        encoder.clear_buffer(&self.boat_spawns_buffer, 0, Some(buffer_size));
+
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Empire Simulation Compute Pass"),
@@ -1177,13 +1762,129 @@ impl EmpireSimulation {
 
         graphics.queue.submit(std::iter::once(encoder.finish()));
         
-        // Async diplomacy processing pipeline - runs as fast as possible without blocking
+        // Process boat spawns from GPU (async readback pipeline)
         // State machine: None → Copy+Request → Poll → Process → None
+        const MAX_BOAT_CAPACITY: usize = 50000;
+        
+        if let Some(rx) = &self.boat_spawns_pending_map {
+            // Try to receive without blocking
+            if let Ok(result) = rx.try_recv() {
+                // Mapping completed! Process the spawn data
+                if result.is_ok() {
+                    let staging_slice = self.boat_spawns_staging_buffer.slice(..);
+                    let spawn_data = staging_slice.get_mapped_range();
+                    let spawn_u32s: &[u32] = bytemuck::cast_slice(&spawn_data);
+                    
+                    let mut spawned_count = 0;
+                    
+                    // Process each cell's spawn request
+                    for y in 0..self.game_size {
+                        for x in 0..self.game_size {
+                            let cell_idx = (y * self.game_size + x) as usize;
+                            let spawn_value = spawn_u32s[cell_idx];
+                            
+                            // Non-zero value means this cell wants to spawn a boat
+                            if spawn_value != 0 {
+                                let empire_id = ((spawn_value >> 16) & 0xFFFF) as u16;
+                                let direction = (spawn_value & 0xFF) as u8;
+                                
+                                // The GPU already wrote the spawn request to the OCEAN cell's index
+                                // So (x, y) IS the ocean position where we should spawn the boat
+                                // The direction tells us which way the boat should move (away from the coast)
+                                
+                                // Check if we're at max boat capacity (50k limit)
+                                const MAX_BOAT_CAPACITY: usize = 50000;
+                                if self.boats.len() >= MAX_BOAT_CAPACITY {
+                                    // Skip spawning - we're at capacity
+                                    continue;
+                                }
+                                
+                                // Verify this is actually ocean before spawning
+                                // terrain_data is RGBA format (4 bytes per pixel), R channel = altitude
+                                let terrain_idx = ((y * self.game_size + x) as usize) * 4;
+                                if terrain_idx < self.terrain_data.len() {
+                                    let altitude = self.terrain_data[terrain_idx]; // Read R channel
+                                    let is_water = altitude < 135; // Ocean cutoff: 0.53 * 255 = 135
+                                    
+                                    if is_water {
+                                        // Spawn boat at this ocean cell with very high strength
+                                        // Boats need to be strong to overcome the 3:1 defender advantage
+                                        // Reference implementation gave boats the cell's full strength or more
+                                        // Using ~60% of max possible strength (40000/65535) for strong boats
+                                        let boat = Boat {
+                                            position: (x as f32, y as f32),
+                                            empire_id,
+                                            strength: 40000, // Strong boat (~61% of max) to overcome defender advantage
+                                            direction,
+                                            age: 0,
+                                        };
+                                        self.boats.push(boat);
+                                        spawned_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if spawned_count > 0 {
+                        println!("GPU spawned {} boats this frame (total: {}/{})", 
+                                spawned_count, self.boats.len(), MAX_BOAT_CAPACITY);
+                    }
+                    
+                    drop(spawn_data);
+                    self.boat_spawns_staging_buffer.unmap();
+                } else {
+                    eprintln!("WARNING: Boat spawns buffer map failed: {:?}", result.err());
+                }
+                
+                // Clear pending state - next frame will start a new request
+                self.boat_spawns_pending_map = None;
+            }
+        } else {
+            // No pending map - start a new copy+request cycle
+            let buffer_size = (self.game_size * self.game_size) as u64 * std::mem::size_of::<u32>() as u64;
+            
+            let mut encoder = graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Boat Spawns Copy Encoder"),
+            });
+            encoder.copy_buffer_to_buffer(&self.boat_spawns_buffer, 0, &self.boat_spawns_staging_buffer, 0, buffer_size);
+            graphics.queue.submit(std::iter::once(encoder.finish()));
+            
+            // Request async mapping
+            let staging_slice = self.boat_spawns_staging_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            staging_slice.map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            self.boat_spawns_pending_map = Some(rx);
+        }
+        
+        // Update boats (movement, landing detection)
+        self.update_boats(graphics);
+        
+        // Async diplomacy processing pipeline - runs every 30 frames to reduce CPU overhead
+        // OPTIMIZATION: Diplomacy runs on a separate thread to not block main simulation
+        let should_process_diplomacy = self.frame_count % 30 == 0;
+        
+        // Check if diplomacy thread has completed work
+        if self.diplomacy_processing {
+            // Try to receive result without blocking
+            if let Ok(response) = self.diplomacy_result_receiver.try_recv() {
+                // Diplomacy processing complete! Upload results to GPU
+                graphics.queue.write_buffer(
+                    &self.diplomacy_relations_buffer,
+                    0,
+                    bytemuck::cast_slice(&response.relations_buffer),
+                );
+                self.diplomacy_processing = false;
+            }
+            // If not ready yet, just continue - don't block!
+        }
         
         if let Some(rx) = &self.diplomacy_pending_map {
             // Try to receive without blocking
             if let Ok(result) = rx.try_recv() {
-                // Mapping completed! Process the data
+                // Mapping completed! Send data to worker thread
                 if result.is_ok() {
                     let staging_slice = self.diplomacy_staging_buffer.slice(..);
                     let counter_data = staging_slice.get_mapped_range();
@@ -1192,45 +1893,29 @@ impl EmpireSimulation {
                     // Count non-zero events for debugging
                     let total_events: u32 = counter_u32s.iter().sum();
                     if total_events > 0 && self.frame_count % 300 == 0 {
-                        println!("📊 Diplomacy: Processed {} events at frame {}", total_events, self.frame_count);
+                        println!("Diplomacy: Processing {} events at frame {} (async)", total_events, self.frame_count);
                     }
                     
-                    // Process counters with personality-based modifiers (using pre-computed cache)
-                    let personality_diffs = &self.personality_diff_cache;
-                    let territory_sizes = std::collections::HashMap::new();
-                    self.diplomacy_state.process_counters(
-                        counter_u32s, 
-                        &territory_sizes,
-                        |a, b| {
-                            let idx = (a as usize) * 2048 + (b as usize);
-                            personality_diffs.get(idx).copied().unwrap_or(0.5)
-                        },
-                    );
+                    // Send work to background thread (non-blocking)
+                    let work_request = DiplomacyWorkRequest {
+                        counters: counter_u32s.to_vec(),
+                        personality_diffs: self.personality_diff_cache.clone(),
+                        frame_count: self.frame_count,
+                    };
                     
-                    // Propagate attack reactions to third parties
-                    // "You attacked my friend/enemy" effects
-                    self.diplomacy_state.propagate_attack_reactions(counter_u32s, |a, b| {
-                        let idx = (a as usize) * 2048 + (b as usize);
-                        personality_diffs.get(idx).copied().unwrap_or(0.5)
-                    });
+                    if self.diplomacy_work_sender.send(work_request).is_ok() {
+                        self.diplomacy_processing = true;
+                    }
                     
                     drop(counter_data);
                     self.diplomacy_staging_buffer.unmap();
-                    
-                    // Upload updated relations to GPU
-                    let relations_data = self.diplomacy_state.to_buffer();
-                    graphics.queue.write_buffer(
-                        &self.diplomacy_relations_buffer,
-                        0,
-                        bytemuck::cast_slice(&relations_data),
-                    );
                 }
                 
                 // Clear pending state - ready for next cycle
                 self.diplomacy_pending_map = None;
             }
-        } else {
-            // No pending map - start a new cycle
+        } else if should_process_diplomacy && !self.diplomacy_processing {
+            // No pending map and it's time to process - start a new cycle
             // Copy counters to staging buffer
             let mut encoder = graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Diplomacy Copy Encoder"),
@@ -1240,16 +1925,15 @@ impl EmpireSimulation {
                 0,
                 &self.diplomacy_staging_buffer,
                 0,
-                (256 * 256 * 4 * std::mem::size_of::<u32>()) as u64,
+                (2048 * 2048 * 5 * std::mem::size_of::<u32>()) as u64,
             );
             graphics.queue.submit(std::iter::once(encoder.finish()));
             
-            // Zero out the counters immediately for next batch
-            let zero_counters = vec![0u32; 256 * 256 * 4];
+            // Zero out the counters immediately for next batch (reuse pre-allocated buffer)
             graphics.queue.write_buffer(
                 &self.diplomacy_counters_buffer,
                 0,
-                bytemuck::cast_slice(&zero_counters),
+                bytemuck::cast_slice(&self.zero_counters_buffer),
             );
             
             // Request async mapping
@@ -1261,6 +1945,77 @@ impl EmpireSimulation {
             
             // Store receiver for next frame
             self.diplomacy_pending_map = Some(rx);
+        }
+        
+        // Empire ownership readback for boats - runs every 60 frames
+        let should_update_ownership = self.frame_count % 60 == 0;
+        
+        if let Some(rx) = &self.empire_pending_readback {
+            // Try to receive without blocking
+            if let Ok(result) = rx.try_recv() {
+                if result.is_ok() {
+                    let empire_slice = self.empire_readback_buffer.slice(..);
+                    let empire_data = empire_slice.get_mapped_range();
+                    let empire_u16s: &[u16] = bytemuck::cast_slice(&empire_data);
+                    
+                    // Extract empire IDs from RGBA16Unorm texture (R channel = empire_id)
+                    for i in 0..(self.game_size * self.game_size) as usize {
+                        let pixel_offset = i * 4;  // 4 channels per pixel
+                        if pixel_offset < empire_u16s.len() {
+                            self.empire_ownership[i] = empire_u16s[pixel_offset];  // R channel
+                        }
+                    }
+                    
+                    drop(empire_data);
+                    self.empire_readback_buffer.unmap();
+                }
+                
+                self.empire_pending_readback = None;
+            }
+        } else if should_update_ownership {
+            // Start a new readback cycle
+            let current_texture = if self.current_is_a {
+                &self.texture_b  // Just wrote to B
+            } else {
+                &self.texture_a  // Just wrote to A
+            };
+            
+            let mut encoder = graphics.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Empire Readback Encoder"),
+            });
+            
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: current_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &self.empire_readback_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(self.game_size * 8),  // 4 channels * 2 bytes
+                        rows_per_image: Some(self.game_size),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.game_size,
+                    height: self.game_size,
+                    depth_or_array_layers: 1,
+                },
+            );
+            
+            graphics.queue.submit(std::iter::once(encoder.finish()));
+            
+            // Request async mapping
+            let empire_slice = self.empire_readback_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            empire_slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            
+            self.empire_pending_readback = Some(rx);
         }
         
         // Flip ping-pong state
@@ -1332,6 +2087,7 @@ impl EmpireSimulation {
                 RenderMode::Need => "Need Heatmap (green=low, yellow=med, red=high)",
                 RenderMode::Action => "Action Visualization (blue=reinforce, red=attack)",
                 RenderMode::Age => "Age Visualization (red=new, green=old)",
+                RenderMode::BoatNeed => "Boat Need Heatmap (blue=low, cyan=med, yellow=high, red=coastal conquest)",
                 RenderMode::Diplomacy => {
                     // Auto-select empire 1 when entering diplomacy mode if none selected
                     if self.perspective_empire == 0 {
@@ -1340,7 +2096,7 @@ impl EmpireSimulation {
                     "Diplomacy Perspective (blue=self, gold=allied, green=neutral, red=enemy)"
                 },
             };
-            println!("🎨 Switched to render mode: {}", mode_name);
+            println!("Switched to render mode: {}", mode_name);
         }
     }
     
@@ -1358,9 +2114,9 @@ impl EmpireSimulation {
         );
         
         if empire_id == 0 {
-            println!("🔭 Cleared diplomacy perspective");
+            println!("Cleared diplomacy perspective");
         } else {
-            println!("🔭 Set diplomacy perspective to Empire {}", empire_id);
+            println!("Set diplomacy perspective to Empire {}", empire_id);
         }
     }
 
@@ -1369,7 +2125,7 @@ impl EmpireSimulation {
             return; // Out of bounds
         }
         
-        println!("🔍 Reading empire at cell ({}, {})", x, y);
+        println!("Reading empire at cell ({}, {})", x, y);
         
         // Instead of blocking, just read the current state synchronously with immediate device poll
         // Create a small staging buffer for one pixel
@@ -1427,17 +2183,17 @@ impl EmpireSimulation {
         let data = buffer_slice.get_mapped_range();
         if data.len() >= 2 {
             let empire_id = u16::from_le_bytes([data[0], data[1]]);
-            println!("✅ Read empire ID: {}", empire_id);
+            println!("Read empire ID: {}", empire_id);
             drop(data);
             staging_buffer.unmap();
             
             if empire_id > 0 {
                 self.set_perspective_empire(empire_id, graphics);
             } else {
-                println!("🔭 Clicked on unclaimed territory (no empire)");
+                println!("Clicked on unclaimed territory (no empire)");
             }
         } else {
-            println!("⚠️  Buffer data too small");
+            println!("WARNING: Buffer data too small");
         }
     }
 
@@ -1458,13 +2214,14 @@ impl EmpireSimulation {
             RenderMode::Action => &self.render_pipeline_action,
             RenderMode::Age => &self.render_pipeline_age,
             RenderMode::Diplomacy => &self.render_pipeline_diplomacy,
+            RenderMode::BoatNeed => &self.render_pipeline_boat_need,
         };
         render_pass.set_pipeline(current_pipeline);
         
         // Use the appropriate texture for display based on render mode
         let display_bind_group = match self.current_render_mode {
-            RenderMode::Age => {
-                // Use auxiliary textures for age visualization
+            RenderMode::Age | RenderMode::BoatNeed => {
+                // Use auxiliary textures for age/boat_need visualization
                 // After the flip, current_is_a indicates which texture was just WRITTEN to
                 // If current_is_a is true, we just wrote to A (because we were reading from B)
                 // If current_is_a is false, we just wrote to B (because we were reading from A)
@@ -1496,6 +2253,18 @@ impl EmpireSimulation {
         render_pass.set_bind_group(1, camera_bind_group, &[]);
         render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         render_pass.draw(0..6, 0..1);
+        
+        // Render boats on top of everything
+        {
+            let num_boats = self.boats.len() as u32;
+            
+            if num_boats > 0 {
+                render_pass.set_pipeline(&self.boat_pipeline);
+                render_pass.set_bind_group(0, camera_bind_group, &[]);    // Camera at group 0 for boats
+                render_pass.set_vertex_buffer(0, self.boat_instance_buffer.slice(..));
+                render_pass.draw(0..6, 0..num_boats);  // 6 vertices per quad, one instance per boat
+            }
+        }
     }
     
     /// Calculate personality difference between two empires (0.0 = identical, 1.0 = maximally different)
